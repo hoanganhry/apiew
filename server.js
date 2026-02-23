@@ -172,6 +172,16 @@ app.post("/api/verify-key", async (req, res) => {
     }
 });
 
+// ===== LIST KEYS =====
+app.get("/list-keys", checkAdmin, async (req, res) => {
+    try {
+        const keys = await loadKeys();
+        res.json(keys);
+    } catch (err) {
+        res.status(500).json({ error: "Server error" });
+    }
+});
+
 // ===== DELETE KEY =====
 app.delete("/delete/:key", checkAdmin, async (req, res) => {
     try {
