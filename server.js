@@ -7,12 +7,13 @@ const PORT = process.env.PORT || 3000;
 const DB_FILE = "./keys.json";
 
 // ===== ADMIN TOKEN =====
-const ADMIN_TOKEN = process.env.ADMIN_TOKEN || "123456"; // đổi nếu muốn
+const ADMIN_TOKEN = process.env.ADMIN_TOKEN || "123456";
 let SERVER_ENABLED = true;
 
 app.use(cors());
 app.use(express.json());
 
+// ===== INIT FILE =====
 if (!fs.existsSync(DB_FILE)) {
     fs.writeJsonSync(DB_FILE, []);
 }
@@ -36,16 +37,17 @@ function generateKey(length = 12) {
 
 // ===== AUTO DELETE EXPIRED =====
 async function autoDeleteExpired() {
-    let keys = await loadKeys();
+    const keys = await loadKeys();
     const now = new Date();
     const valid = keys.filter(k => new Date(k.expiresAt) > now);
     if (valid.length !== keys.length) {
         await saveKeys(valid);
+        console.log("Expired keys removed");
     }
 }
 setInterval(autoDeleteExpired, 60000);
 
-// ===== ADMIN CHECK MIDDLEWARE =====
+// ===== ADMIN CHECK =====
 function checkAdmin(req, res, next) {
     const token = req.headers["x-admin-token"];
     if (token !== ADMIN_TOKEN) {
@@ -56,115 +58,133 @@ function checkAdmin(req, res, next) {
 
 // ===== CREATE KEY =====
 app.post("/create", checkAdmin, async (req, res) => {
-    const { owner, duration, unit, deviceLimit, customKey } = req.body;
+    try {
+        const { owner, duration, unit, deviceLimit, customKey } = req.body;
 
-    if (!owner || !duration || !unit) {
-        return res.status(400).json({ error: "Missing data" });
+        if (!owner || !duration || !unit) {
+            return res.status(400).json({ error: "Missing data" });
+        }
+
+        let ms = 0;
+        if (unit === "hours") ms = duration * 3600000;
+        if (unit === "days") ms = duration * 86400000;
+        if (unit === "weeks") ms = duration * 7 * 86400000;
+        if (unit === "months") ms = duration * 30 * 86400000;
+
+        const expiresAt = new Date(Date.now() + ms);
+        const keys = await loadKeys();
+
+        const apiKey = customKey
+            ? customKey.toUpperCase()
+            : generateKey(12);
+
+        if (keys.find(k => k.apiKey === apiKey)) {
+            return res.status(400).json({ error: "Key already exists" });
+        }
+
+        const newKey = {
+            apiKey,
+            owner,
+            createdAt: new Date().toISOString(),
+            expiresAt: expiresAt.toISOString(),
+            deviceLimit: deviceLimit || 1,
+            devices: []
+        };
+
+        keys.push(newKey);
+        await saveKeys(keys);
+
+        res.json(newKey);
+
+    } catch (err) {
+        res.status(500).json({ error: "Server error" });
     }
-
-    let ms = 0;
-    if (unit === "hours") ms = duration * 3600000;
-    if (unit === "days") ms = duration * 86400000;
-    if (unit === "weeks") ms = duration * 7 * 86400000;
-    if (unit === "months") ms = duration * 30 * 86400000;
-
-    const expiresAt = new Date(Date.now() + ms);
-    const keys = await loadKeys();
-
-    let apiKey = customKey ? customKey.toUpperCase() : generateKey(12);
-
-    if (keys.find(k => k.apiKey === apiKey)) {
-        return res.status(400).json({ error: "Key already exists" });
-    }
-
-    const newKey = {
-        apiKey,
-        owner,
-        createdAt: new Date().toISOString(),
-        expiresAt: expiresAt.toISOString(),
-        deviceLimit: deviceLimit || 1,
-        devices: []
-    };
-
-    keys.push(newKey);
-    await saveKeys(keys);
-
-    res.json(newKey);
 });
 
-app.post('/api/verify-key', async (req, res) => {
-  try {
-    const { key, device_id, api_code } = req.body || {};
-    
-    if (!key || !device_id) {
-      return res.status(400).json({ 
-        success: false, 
-        message: 'Thiếu key hoặc device_id',
-        error_code: 'MISSING_PARAMS'
-      });
+// ===== VERIFY KEY =====
+app.post("/api/verify-key", async (req, res) => {
+    try {
+
+        if (!SERVER_ENABLED) {
+            return res.status(503).json({
+                success: false,
+                message: "Server đang tắt"
+            });
+        }
+
+        const { key, device_id } = req.body || {};
+
+        if (!key || !device_id) {
+            return res.status(400).json({
+                success: false,
+                message: "Thiếu key hoặc device_id",
+                error_code: "MISSING_PARAMS"
+            });
+        }
+
+        const keys = await loadKeys();
+        const found = keys.find(k => k.apiKey === key);
+
+        if (!found) {
+            return res.status(404).json({
+                success: false,
+                message: "Key không tồn tại",
+                error_code: "KEY_NOT_FOUND"
+            });
+        }
+
+        if (new Date(found.expiresAt) < new Date()) {
+            return res.status(403).json({
+                success: false,
+                message: "Key đã hết hạn",
+                error_code: "KEY_EXPIRED"
+            });
+        }
+
+        // ===== CHECK DEVICE LIMIT =====
+        if (!found.devices.includes(device_id)) {
+
+            if (found.devices.length >= found.deviceLimit) {
+                return res.status(403).json({
+                    success: false,
+                    message: "Đã vượt quá số thiết bị cho phép",
+                    error_code: "DEVICE_LIMIT"
+                });
+            }
+
+            found.devices.push(device_id);
+            await saveKeys(keys);
+        }
+
+        res.json({
+            success: true,
+            message: "Key hợp lệ",
+            expiresAt: found.expiresAt,
+            deviceCount: found.devices.length,
+            deviceLimit: found.deviceLimit
+        });
+
+    } catch (err) {
+        res.status(500).json({
+            success: false,
+            message: "Server error"
+        });
     }
-
-    const keys = await loadKeys();
-    const found = keys.find(k => k.apiKey === key);
-    
-    if (!found) {
-      return res.status(404).json({ 
-        success: false, 
-        message: 'Key không tồn tại',
-        error_code: 'KEY_NOT_FOUND'
-      });
-    }
-
-    const now = new Date();
-    if (new Date(found.expiresAt) < now) {
-      return res.status(403).json({ 
-        success: false, 
-        message: 'Key đã hết hạn',
-        error_code: 'KEY_EXPIRED'
-      });
-    }
-
-    if (found.devices.includes(device_id)) {
-      return res.json({ 
-        success: true, 
-        message: 'Device đã được đăng ký'
-      });
-    }
-
-    if (found.devices.length >= found.deviceLimit) {
-      return res.status(403).json({ 
-        success: false, 
-        message: 'Vượt quá giới hạn device',
-        error_code: 'DEVICE_LIMIT_EXCEEDED'
-      });
-    }
-
-    found.devices.push(device_id);
-    await saveKeys(keys);
-
-    res.json({ 
-      success: true, 
-      message: 'Xác minh thành công',
-      data: { owner: found.owner, deviceLimit: found.deviceLimit }
-    });
-  } catch (error) {
-    res.status(500).json({ 
-      success: false, 
-      message: 'Lỗi server',
-      error_code: 'SERVER_ERROR'
-    });
-  }
 });
 
 // ===== DELETE KEY =====
 app.delete("/delete/:key", checkAdmin, async (req, res) => {
-    let keys = await loadKeys();
-    keys = keys.filter(k => k.apiKey !== req.params.key);
-    await saveKeys(keys);
-    res.json({ message: "Deleted" });
+    try {
+        let keys = await loadKeys();
+        keys = keys.filter(k => k.apiKey !== req.params.key);
+        await saveKeys(keys);
+        res.json({ message: "Deleted" });
+    } catch {
+        res.status(500).json({ error: "Server error" });
+    }
 });
 
-// ===== TOGGLE SERVER ON/OFF =====
+// ===== TOGGLE SERVER =====
 app.post("/server-toggle", checkAdmin, (req, res) => {
     SERVER_ENABLED = !SERVER_ENABLED;
     res.json({
@@ -172,6 +192,7 @@ app.post("/server-toggle", checkAdmin, (req, res) => {
     });
 });
 
+// ===== HOME =====
 app.get("/", (req, res) => {
     res.json({
         status: "Key API running",
@@ -179,6 +200,7 @@ app.get("/", (req, res) => {
     });
 });
 
+// ===== START =====
 app.listen(PORT, () => {
     console.log("Server running on port " + PORT);
 });
