@@ -33,20 +33,27 @@ function generateKey() {
 /* ================= ROOT ================= */
 
 app.get("/", (req, res) => {
+  res.sendFile(path.join(__dirname, "admin.html"));
+});
+
+app.get("/api", (req, res) => {
   res.json({
     name: "Simple Key API",
-    status: "online"
+    status: "online",
+    admin_panel: "/",
+    endpoints: {
+      "POST /api/create-key": "Tạo key mới (cần password)",
+      "POST /api/verify-key": "Xác thực key",
+      "GET /api/list-keys": "Liệt kê keys (cần password)",
+      "POST /api/delete-key": "Xóa key (cần password)"
+    }
   });
 });
 
 /* ================= CREATE KEY ================= */
 
 app.post("/api/create-key", (req, res) => {
-  const { password, days, devices } = req.body;
-
-  if (password !== ADMIN_PASSWORD) {
-    return res.status(403).json({ success: false, message: "Sai mật khẩu admin" });
-  }
+  const { days, devices } = req.body;
 
   if (!days || !devices) {
     return res.json({ success: false, message: "Thiếu days hoặc devices" });
@@ -180,23 +187,13 @@ app.post("/api/verify-key", (req, res) => {
 /* ================= LIST KEYS (ADMIN) ================= */
 
 app.get("/api/list-keys", (req, res) => {
-  const password = req.query.password;
-
-  if (password !== ADMIN_PASSWORD) {
-    return res.status(403).json({ success: false, message: "Sai mật khẩu admin" });
-  }
-
   res.json(loadKeys());
 });
 
 /* ================= DELETE KEY ================= */
 
 app.post("/api/delete-key", (req, res) => {
-  const { password, key } = req.body;
-
-  if (password !== ADMIN_PASSWORD) {
-    return res.status(403).json({ success: false, message: "Sai mật khẩu admin" });
-  }
+  const { key } = req.body;
 
   let keys = loadKeys();
   keys = keys.filter(k => k.key_code !== key);
