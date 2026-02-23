@@ -70,7 +70,72 @@ app.post("/api/create-key", (req, res) => {
   res.json({ success: true, key: newKey });
 });
 
-/* ================= VERIFY KEY ================= */
+/* ================= VERIFY KEY - GET (DOCUMENTATION) ================= */
+
+app.get("/api/verify-key", (req, res) => {
+  res.json({
+    status: "success",
+    endpoint: "POST /api/verify-key",
+    description: "Xác thực key và thiết bị",
+    request: {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json"
+      },
+      body: {
+        key: "string - mã key cần xác thực (VD: KEY-A1B2C3D4E5F6G7H8)",
+        device_id: "string - ID thiết bị duy nhất (VD: device-uuid-1234)"
+      }
+    },
+    response_success: {
+      success: true,
+      message: "Xác thực thành công",
+      expires_at: "2025-03-25T10:30:45.123Z",
+      devices_remaining: 2
+    },
+    response_error_examples: [
+      {
+        error: "Key không tồn tại",
+        status: 404,
+        response: {
+          success: false,
+          message: "Key không tồn tại"
+        }
+      },
+      {
+        error: "Key đã hết hạn",
+        status: 200,
+        response: {
+          success: false,
+          message: "Key đã hết hạn"
+        }
+      },
+      {
+        error: "Đã đạt giới hạn thiết bị",
+        status: 200,
+        response: {
+          success: false,
+          message: "Đã đạt giới hạn thiết bị"
+        }
+      },
+      {
+        error: "Thiếu dữ liệu",
+        status: 400,
+        response: {
+          success: false,
+          message: "Thiếu key hoặc device_id"
+        }
+      }
+    ],
+    example_usage: {
+      curl: "curl -X POST https://bulonnn.onrender.com/api/verify-key -H \"Content-Type: application/json\" -d '{\"key\": \"KEY-A1B2C3D4E5F6G7H8\", \"device_id\": \"device-uuid-1234\"}'",
+      javascript: "fetch('https://bulonnn.onrender.com/api/verify-key', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({key: 'KEY-A1B2C3D4E5F6G7H8', device_id: 'device-uuid-1234'})})",
+      python: "requests.post('https://bulonnn.onrender.com/api/verify-key', json={'key': 'KEY-A1B2C3D4E5F6G7H8', 'device_id': 'device-uuid-1234'})"
+    }
+  });
+});
+
+/* ================= VERIFY KEY - POST (ACTION) ================= */
 
 app.post("/api/verify-key", (req, res) => {
   const { key, device_id } = req.body;
