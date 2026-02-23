@@ -1,201 +1,162 @@
-const express = require("express");
-const fs = require("fs");
-const cors = require("cors");
+import express from "express";
+import cors from "cors";
+import fs from "fs-extra";
 
 const app = express();
-app.use(express.json());
+const PORT = process.env.PORT || 3000;
+const DB_FILE = "./keys.json";
+
+// ===== ADMIN TOKEN =====
+const ADMIN_TOKEN = process.env.ADMIN_TOKEN || "123456"; // đổi nếu muốn
+let SERVER_ENABLED = true;
+
 app.use(cors());
+app.use(express.json());
 
-const PORT = process.env.PORT || 10000;
-const FILE = "keys.json";
-
-if (!fs.existsSync(FILE)) fs.writeFileSync(FILE, "[]");
-
-function loadKeys() {
-    return JSON.parse(fs.readFileSync(FILE));
+if (!fs.existsSync(DB_FILE)) {
+    fs.writeJsonSync(DB_FILE, []);
 }
 
-function saveKeys(data) {
-    fs.writeFileSync(FILE, JSON.stringify(data, null, 2));
+async function loadKeys() {
+    return await fs.readJson(DB_FILE);
 }
 
-function generateKey() {
+async function saveKeys(data) {
+    await fs.writeJson(DB_FILE, data, { spaces: 2 });
+}
+
+function generateKey(length = 12) {
     const chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
-    let key = "";
-    for (let i = 0; i < 12; i++) {
-        key += chars[Math.floor(Math.random() * chars.length)];
+    let result = "";
+    for (let i = 0; i < length; i++) {
+        result += chars.charAt(Math.floor(Math.random() * chars.length));
     }
-    return key;
+    return result;
 }
 
-function calcExpire(duration, unit) {
-    const now = Date.now();
-    const map = {
-        hour: 3600000,
-        day: 86400000,
-        week: 604800000,
-        month: 2592000000
-    };
-    return now + duration * (map[unit] || map.day);
+// ===== AUTO DELETE EXPIRED =====
+async function autoDeleteExpired() {
+    let keys = await loadKeys();
+    const now = new Date();
+    const valid = keys.filter(k => new Date(k.expiresAt) > now);
+    if (valid.length !== keys.length) {
+        await saveKeys(valid);
+    }
+}
+setInterval(autoDeleteExpired, 60000);
+
+// ===== ADMIN CHECK MIDDLEWARE =====
+function checkAdmin(req, res, next) {
+    const token = req.headers["x-admin-token"];
+    if (token !== ADMIN_TOKEN) {
+        return res.status(403).json({ error: "Invalid admin token" });
+    }
+    next();
 }
 
-/* =========================
-   MAINTENANCE MODE
-========================= */
+// ===== CREATE KEY =====
+app.post("/create", checkAdmin, async (req, res) => {
+    const { owner, duration, unit, deviceLimit, customKey } = req.body;
 
-let maintenanceMode = false;
+    if (!owner || !duration || !unit) {
+        return res.status(400).json({ error: "Missing data" });
+    }
 
-app.post("/admin/maintenance", (req, res) => {
-    maintenanceMode = req.body.enabled;
-    res.json({ success: true, maintenance: maintenanceMode });
-});
+    let ms = 0;
+    if (unit === "hours") ms = duration * 3600000;
+    if (unit === "days") ms = duration * 86400000;
+    if (unit === "weeks") ms = duration * 7 * 86400000;
+    if (unit === "months") ms = duration * 30 * 86400000;
 
-/* =========================
-   AUTO DELETE EXPIRED KEY
-========================= */
+    const expiresAt = new Date(Date.now() + ms);
+    const keys = await loadKeys();
 
-setInterval(() => {
-    const keys = loadKeys();
-    const filtered = keys.filter(k => k.expiresAt > Date.now());
-    saveKeys(filtered);
-}, 60000);
+    let apiKey = customKey ? customKey.toUpperCase() : generateKey(12);
 
-/* =========================
-   CREATE KEY
-========================= */
-
-app.post("/create", (req, res) => {
-    const { duration, unit, deviceLimit, customKey } = req.body;
-
-    let keys = loadKeys();
+    if (keys.find(k => k.apiKey === apiKey)) {
+        return res.status(400).json({ error: "Key already exists" });
+    }
 
     const newKey = {
-        apiKey: customKey || generateKey(),
-        createdAt: Date.now(),
-        expiresAt: calcExpire(duration, unit),
+        apiKey,
+        owner,
+        createdAt: new Date().toISOString(),
+        expiresAt: expiresAt.toISOString(),
         deviceLimit: deviceLimit || 1,
-        devices: [],
-        lastVerify: 0
+        devices: []
     };
 
     keys.push(newKey);
-    saveKeys(keys);
+    await saveKeys(keys);
 
     res.json(newKey);
 });
 
-/* =========================
-   LIST KEY
-========================= */
-
-app.get("/list", (req, res) => {
-    res.json(loadKeys());
-});
-
-/* =========================
-   DELETE KEY
-========================= */
-
-app.delete("/delete/:key", (req, res) => {
-    let keys = loadKeys();
-    keys = keys.filter(k => k.apiKey !== req.params.key);
-    saveKeys(keys);
-    res.json({ success: true });
-});
-
-/* =========================
-   RESET DEVICE
-========================= */
-
-app.post("/reset-device", (req, res) => {
-    const { key } = req.body;
-    let keys = loadKeys();
-    const found = keys.find(k => k.apiKey === key);
-
-    if (!found)
-        return res.json({ success: false });
-
-    found.devices = [];
-    saveKeys(keys);
-
-    res.json({ success: true });
-});
-
-/* =========================
-   VERIFY KEY (DÙNG CHO APP)
-========================= */
-
-app.post("/api/verify-key", (req, res) => {
-
-    if (maintenanceMode) {
-        return res.json({
-            success: false,
-            message: "Server under maintenance"
-        });
+// ===== VERIFY =====
+// Shared verify helper used by endpoints
+async function verifyKey(apiKey, deviceId) {
+    if (!SERVER_ENABLED) {
+        return { valid: false, message: "Server is under maintenance" };
     }
 
-    const { key, deviceId } = req.body;
+    const keys = await loadKeys();
+    const key = keys.find(k => k.apiKey === apiKey);
 
-    if (!key || !deviceId) {
-        return res.json({
-            success: false,
-            message: "Missing key or deviceId"
-        });
+    if (!key) return { valid: false, message: "Invalid key" };
+
+    if (new Date(key.expiresAt) < new Date()) {
+        return { valid: false, message: "Expired" };
     }
 
-    let keys = loadKeys();
-    const found = keys.find(k => k.apiKey === key);
-
-    if (!found) {
-        return res.json({
-            success: false,
-            message: "Invalid key"
-        });
-    }
-
-    if (found.expiresAt < Date.now()) {
-        return res.json({
-            success: false,
-            message: "Key expired"
-        });
-    }
-
-    // Anti spam verify (2 giây)
-    if (Date.now() - found.lastVerify < 2000) {
-        return res.json({
-            success: false,
-            message: "Too many requests"
-        });
-    }
-
-    found.lastVerify = Date.now();
-
-    if (!found.devices.includes(deviceId)) {
-
-        if (found.devices.length >= found.deviceLimit) {
-            return res.json({
-                success: false,
-                message: "Device limit reached"
-            });
+    if (deviceId && !key.devices.includes(deviceId)) {
+        if (key.devices.length >= key.deviceLimit) {
+            return { valid: false, message: "Device limit reached" };
         }
 
-        found.devices.push(deviceId);
+        key.devices.push(deviceId);
+        await saveKeys(keys);
     }
 
-    saveKeys(keys);
+    return { valid: true, owner: key.owner, expiresAt: key.expiresAt };
+}
 
-    return res.json({
-        success: true,
-        message: "Key valid",
-        expiresAt: found.expiresAt,
-        devicesUsed: found.devices.length,
-        deviceLimit: found.deviceLimit
-    });
-
+// Existing verify endpoint now uses shared helper
+app.post("/verify", async (req, res) => {
+    const { apiKey, deviceId } = req.body;
+    const result = await verifyKey(apiKey, deviceId);
+    res.json(result);
 });
 
-/* ========================= */
+// New endpoint as requested: /verifyKey
+app.post("/verifyKey", async (req, res) => {
+    const { apiKey, deviceId } = req.body;
+    const result = await verifyKey(apiKey, deviceId);
+    res.json(result);
+});
+
+// ===== DELETE KEY =====
+app.delete("/delete/:key", checkAdmin, async (req, res) => {
+    let keys = await loadKeys();
+    keys = keys.filter(k => k.apiKey !== req.params.key);
+    await saveKeys(keys);
+    res.json({ message: "Deleted" });
+});
+
+// ===== TOGGLE SERVER ON/OFF =====
+app.post("/server-toggle", checkAdmin, (req, res) => {
+    SERVER_ENABLED = !SERVER_ENABLED;
+    res.json({
+        serverEnabled: SERVER_ENABLED
+    });
+});
+
+app.get("/", (req, res) => {
+    res.json({
+        status: "Key API running",
+        serverEnabled: SERVER_ENABLED
+    });
+});
 
 app.listen(PORT, () => {
-    console.log("Server running on port", PORT);
+    console.log("Server running on port " + PORT);
 });
