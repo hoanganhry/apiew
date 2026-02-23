@@ -39,14 +39,20 @@ function calcExpire(duration, unit) {
     return now + duration * (map[unit] || map.day);
 }
 
+// AUTO XOÁ KEY HẾT HẠN
 setInterval(() => {
     const keys = loadKeys();
     const filtered = keys.filter(k => k.expiresAt > Date.now());
     saveKeys(filtered);
 }, 60000);
 
+
+// ============================
+// CREATE KEY
+// ============================
 app.post("/create", (req, res) => {
     const { duration, unit, deviceLimit, customKey } = req.body;
+
     let keys = loadKeys();
 
     const newKey = {
@@ -63,10 +69,18 @@ app.post("/create", (req, res) => {
     res.json(newKey);
 });
 
+
+// ============================
+// LIST KEY
+// ============================
 app.get("/list", (req, res) => {
     res.json(loadKeys());
 });
 
+
+// ============================
+// DELETE KEY
+// ============================
 app.delete("/delete/:key", (req, res) => {
     let keys = loadKeys();
     keys = keys.filter(k => k.apiKey !== req.params.key);
@@ -74,19 +88,29 @@ app.delete("/delete/:key", (req, res) => {
     res.json({ success: true });
 });
 
+
+// ============================
+// VERIFY KEY
+// ============================
 app.post("/verify", (req, res) => {
     const { key, deviceId } = req.body;
+
     let keys = loadKeys();
     const found = keys.find(k => k.apiKey === key);
 
-    if (!found) return res.json({ success: false, message: "Key not found" });
+    if (!found)
+        return res.json({ success: false, message: "Key not found" });
 
     if (found.expiresAt < Date.now())
         return res.json({ success: false, message: "Expired" });
 
     if (!found.devices.includes(deviceId)) {
+
         if (found.devices.length >= found.deviceLimit)
-            return res.json({ success: false, message: "Device limit reached" });
+            return res.json({
+                success: false,
+                message: "Device limit reached"
+            });
 
         found.devices.push(deviceId);
         saveKeys(keys);
@@ -95,9 +119,30 @@ app.post("/verify", (req, res) => {
     res.json({
         success: true,
         expiresAt: found.expiresAt,
-        devicesUsed: found.devices.length
+        devicesUsed: found.devices.length,
+        deviceLimit: found.deviceLimit
     });
 });
+
+
+// ============================
+// RESET DEVICE
+// ============================
+app.post("/reset-device", (req, res) => {
+    const { key } = req.body;
+
+    let keys = loadKeys();
+    const found = keys.find(k => k.apiKey === key);
+
+    if (!found)
+        return res.json({ success: false });
+
+    found.devices = [];
+    saveKeys(keys);
+
+    res.json({ success: true });
+});
+
 
 app.listen(PORT, () => {
     console.log("Server running on port", PORT);
