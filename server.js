@@ -39,17 +39,31 @@ function calcExpire(duration, unit) {
     return now + duration * (map[unit] || map.day);
 }
 
-// AUTO XOÁ KEY HẾT HẠN
+/* =========================
+   MAINTENANCE MODE
+========================= */
+
+let maintenanceMode = false;
+
+app.post("/admin/maintenance", (req, res) => {
+    maintenanceMode = req.body.enabled;
+    res.json({ success: true, maintenance: maintenanceMode });
+});
+
+/* =========================
+   AUTO DELETE EXPIRED KEY
+========================= */
+
 setInterval(() => {
     const keys = loadKeys();
     const filtered = keys.filter(k => k.expiresAt > Date.now());
     saveKeys(filtered);
 }, 60000);
 
+/* =========================
+   CREATE KEY
+========================= */
 
-// ============================
-// CREATE KEY
-// ============================
 app.post("/create", (req, res) => {
     const { duration, unit, deviceLimit, customKey } = req.body;
 
@@ -60,7 +74,8 @@ app.post("/create", (req, res) => {
         createdAt: Date.now(),
         expiresAt: calcExpire(duration, unit),
         deviceLimit: deviceLimit || 1,
-        devices: []
+        devices: [],
+        lastVerify: 0
     };
 
     keys.push(newKey);
@@ -69,18 +84,18 @@ app.post("/create", (req, res) => {
     res.json(newKey);
 });
 
+/* =========================
+   LIST KEY
+========================= */
 
-// ============================
-// LIST KEY
-// ============================
 app.get("/list", (req, res) => {
     res.json(loadKeys());
 });
 
+/* =========================
+   DELETE KEY
+========================= */
 
-// ============================
-// DELETE KEY
-// ============================
 app.delete("/delete/:key", (req, res) => {
     let keys = loadKeys();
     keys = keys.filter(k => k.apiKey !== req.params.key);
@@ -88,49 +103,12 @@ app.delete("/delete/:key", (req, res) => {
     res.json({ success: true });
 });
 
+/* =========================
+   RESET DEVICE
+========================= */
 
-// ============================
-// VERIFY KEY
-// ============================
-app.post("/verify", (req, res) => {
-    const { key, deviceId } = req.body;
-
-    let keys = loadKeys();
-    const found = keys.find(k => k.apiKey === key);
-
-    if (!found)
-        return res.json({ success: false, message: "Key not found" });
-
-    if (found.expiresAt < Date.now())
-        return res.json({ success: false, message: "Expired" });
-
-    if (!found.devices.includes(deviceId)) {
-
-        if (found.devices.length >= found.deviceLimit)
-            return res.json({
-                success: false,
-                message: "Device limit reached"
-            });
-
-        found.devices.push(deviceId);
-        saveKeys(keys);
-    }
-
-    res.json({
-        success: true,
-        expiresAt: found.expiresAt,
-        devicesUsed: found.devices.length,
-        deviceLimit: found.deviceLimit
-    });
-});
-
-
-// ============================
-// RESET DEVICE
-// ============================
 app.post("/reset-device", (req, res) => {
     const { key } = req.body;
-
     let keys = loadKeys();
     const found = keys.find(k => k.apiKey === key);
 
@@ -143,6 +121,80 @@ app.post("/reset-device", (req, res) => {
     res.json({ success: true });
 });
 
+/* =========================
+   VERIFY KEY (DÙNG CHO APP)
+========================= */
+
+app.post("/api/verify-key", (req, res) => {
+
+    if (maintenanceMode) {
+        return res.json({
+            success: false,
+            message: "Server under maintenance"
+        });
+    }
+
+    const { key, deviceId } = req.body;
+
+    if (!key || !deviceId) {
+        return res.json({
+            success: false,
+            message: "Missing key or deviceId"
+        });
+    }
+
+    let keys = loadKeys();
+    const found = keys.find(k => k.apiKey === key);
+
+    if (!found) {
+        return res.json({
+            success: false,
+            message: "Invalid key"
+        });
+    }
+
+    if (found.expiresAt < Date.now()) {
+        return res.json({
+            success: false,
+            message: "Key expired"
+        });
+    }
+
+    // Anti spam verify (2 giây)
+    if (Date.now() - found.lastVerify < 2000) {
+        return res.json({
+            success: false,
+            message: "Too many requests"
+        });
+    }
+
+    found.lastVerify = Date.now();
+
+    if (!found.devices.includes(deviceId)) {
+
+        if (found.devices.length >= found.deviceLimit) {
+            return res.json({
+                success: false,
+                message: "Device limit reached"
+            });
+        }
+
+        found.devices.push(deviceId);
+    }
+
+    saveKeys(keys);
+
+    return res.json({
+        success: true,
+        message: "Key valid",
+        expiresAt: found.expiresAt,
+        devicesUsed: found.devices.length,
+        deviceLimit: found.deviceLimit
+    });
+
+});
+
+/* ========================= */
 
 app.listen(PORT, () => {
     console.log("Server running on port", PORT);
