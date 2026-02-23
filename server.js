@@ -1,162 +1,175 @@
-import express from "express";
-import cors from "cors";
-import fs from "fs-extra";
+const express = require('express');
+const cors = require('cors');
+const fs = require('fs');
+const path = require('path');
+const crypto = require('crypto');
+const { v4: uuidv4 } = require('uuid');
 
 const app = express();
-const PORT = process.env.PORT || 3000;
-const DB_FILE = "./keys.json";
-
-// ===== ADMIN TOKEN =====
-const ADMIN_TOKEN = process.env.ADMIN_TOKEN || "123456"; // đổi nếu muốn
-let SERVER_ENABLED = true;
-
 app.use(cors());
 app.use(express.json());
 
-if (!fs.existsSync(DB_FILE)) {
-    fs.writeJsonSync(DB_FILE, []);
+const PORT = process.env.PORT || 10000;
+const MASTER_SECRET = process.env.MASTER_SECRET || "my_super_secret_123";
+
+const DATA_FILE = path.join(__dirname, 'keys.json');
+const BACKUP_DIR = path.join(__dirname, 'backups');
+
+if (!fs.existsSync(DATA_FILE)) fs.writeFileSync(DATA_FILE, "[]");
+if (!fs.existsSync(BACKUP_DIR)) fs.mkdirSync(BACKUP_DIR);
+
+function loadKeys() {
+  return JSON.parse(fs.readFileSync(DATA_FILE));
 }
 
-async function loadKeys() {
-    return await fs.readJson(DB_FILE);
+function saveKeys(data) {
+  fs.writeFileSync(DATA_FILE, JSON.stringify(data, null, 2));
 }
 
-async function saveKeys(data) {
-    await fs.writeJson(DB_FILE, data, { spaces: 2 });
+function now() {
+  return new Date().toISOString();
 }
 
-function generateKey(length = 12) {
-    const chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
-    let result = "";
-    for (let i = 0; i < length; i++) {
-        result += chars.charAt(Math.floor(Math.random() * chars.length));
-    }
-    return result;
+function generateKey(type="KEY") {
+  return `${type}-${crypto.randomBytes(3).toString('hex').toUpperCase()}`;
 }
 
-// ===== AUTO DELETE EXPIRED =====
-async function autoDeleteExpired() {
-    let keys = await loadKeys();
-    const now = new Date();
-    const valid = keys.filter(k => new Date(k.expiresAt) > now);
-    if (valid.length !== keys.length) {
-        await saveKeys(valid);
-    }
-}
-setInterval(autoDeleteExpired, 60000);
-
-// ===== ADMIN CHECK MIDDLEWARE =====
-function checkAdmin(req, res, next) {
-    const token = req.headers["x-admin-token"];
-    if (token !== ADMIN_TOKEN) {
-        return res.status(403).json({ error: "Invalid admin token" });
-    }
-    next();
+function createBackup() {
+  const file = path.join(BACKUP_DIR, `backup-${Date.now()}.json`);
+  fs.copyFileSync(DATA_FILE, file);
 }
 
-// ===== CREATE KEY =====
-app.post("/create", checkAdmin, async (req, res) => {
-    const { owner, duration, unit, deviceLimit, customKey } = req.body;
+setInterval(createBackup, 6 * 60 * 60 * 1000);
 
-    if (!owner || !duration || !unit) {
-        return res.status(400).json({ error: "Missing data" });
-    }
+function authMiddleware(req, res, next) {
+  const secret = req.headers['x-master-secret'];
+  if (secret !== MASTER_SECRET) {
+    return res.status(403).json({ success:false, message:"Unauthorized" });
+  }
+  next();
+}
 
-    let ms = 0;
-    if (unit === "hours") ms = duration * 3600000;
-    if (unit === "days") ms = duration * 86400000;
-    if (unit === "weeks") ms = duration * 7 * 86400000;
-    if (unit === "months") ms = duration * 30 * 86400000;
+/* ================= CREATE KEY ================= */
+app.post('/api/create-key', authMiddleware, (req,res)=>{
+  const { days, devices, type, customKey, alias } = req.body;
+  if(!days || !devices) return res.json({success:false,message:"Missing data"});
 
-    const expiresAt = new Date(Date.now() + ms);
-    const keys = await loadKeys();
+  const keys = loadKeys();
+  const keyCode = customKey || generateKey(type);
 
-    let apiKey = customKey ? customKey.toUpperCase() : generateKey(12);
+  if(keys.find(k=>k.key_code===keyCode))
+    return res.json({success:false,message:"Key exists"});
 
-    if (keys.find(k => k.apiKey === apiKey)) {
-        return res.status(400).json({ error: "Key already exists" });
-    }
+  const record = {
+    id: uuidv4(),
+    key_code: keyCode,
+    type: type || "KEY",
+    created_at: now(),
+    expires_at: new Date(Date.now()+days*86400000).toISOString(),
+    allowed_devices: Number(devices),
+    devices: [],
+    alias_name: alias || null,
+    total_verifications: 0,
+    last_verified: null
+  };
 
-    const newKey = {
-        apiKey,
-        owner,
-        createdAt: new Date().toISOString(),
-        expiresAt: expiresAt.toISOString(),
-        deviceLimit: deviceLimit || 1,
-        devices: []
+  keys.push(record);
+  saveKeys(keys);
+
+  res.json({success:true,key:record});
+});
+
+/* ================= BULK CREATE ================= */
+app.post('/api/bulk-create', authMiddleware, (req,res)=>{
+  const { count, days, devices, type } = req.body;
+  if(!count || count>100) return res.json({success:false});
+
+  const keys = loadKeys();
+  const created=[];
+
+  for(let i=0;i<count;i++){
+    const record={
+      id:uuidv4(),
+      key_code:generateKey(type),
+      type:type||"KEY",
+      created_at:now(),
+      expires_at:new Date(Date.now()+days*86400000).toISOString(),
+      allowed_devices:Number(devices),
+      devices:[],
+      alias_name:null,
+      total_verifications:0,
+      last_verified:null
     };
+    keys.push(record);
+    created.push(record);
+  }
 
-    keys.push(newKey);
-    await saveKeys(keys);
-
-    res.json(newKey);
+  saveKeys(keys);
+  res.json({success:true,keys:created});
 });
 
-// ===== VERIFY =====
-// Shared verify helper used by endpoints
-async function verifyKey(apiKey, deviceId) {
-    if (!SERVER_ENABLED) {
-        return { valid: false, message: "Server is under maintenance" };
-    }
+/* ================= VERIFY KEY ================= */
+app.post('/api/verify-key',(req,res)=>{
+  const { key, device_id } = req.body;
+  if(!key||!device_id)
+    return res.json({success:false,message:"Missing key/device"});
 
-    const keys = await loadKeys();
-    const key = keys.find(k => k.apiKey === apiKey);
+  const keys=loadKeys();
+  const found=keys.find(k=>k.key_code===key);
+  if(!found)
+    return res.json({success:false,message:"Key not found"});
 
-    if (!key) return { valid: false, message: "Invalid key" };
+  if(new Date(found.expires_at)<new Date())
+    return res.json({success:false,message:"Expired"});
 
-    if (new Date(key.expiresAt) < new Date()) {
-        return { valid: false, message: "Expired" };
-    }
+  if(!found.devices.includes(device_id)){
+    if(found.devices.length>=found.allowed_devices)
+      return res.json({success:false,message:"Device limit reached"});
+    found.devices.push(device_id);
+  }
 
-    if (deviceId && !key.devices.includes(deviceId)) {
-        if (key.devices.length >= key.deviceLimit) {
-            return { valid: false, message: "Device limit reached" };
-        }
+  found.total_verifications++;
+  found.last_verified=now();
+  saveKeys(keys);
 
-        key.devices.push(deviceId);
-        await saveKeys(keys);
-    }
-
-    return { valid: true, owner: key.owner, expiresAt: key.expiresAt };
-}
-
-// Existing verify endpoint now uses shared helper
-app.post("/verify", async (req, res) => {
-    const { apiKey, deviceId } = req.body;
-    const result = await verifyKey(apiKey, deviceId);
-    res.json(result);
+  res.json({
+    success:true,
+    expires_at:found.expires_at,
+    devices_remaining:found.allowed_devices-found.devices.length,
+    alias:found.alias_name
+  });
 });
 
-// New endpoint as requested: /verifyKey
-app.post("/verifyKey", async (req, res) => {
-    const { apiKey, deviceId } = req.body;
-    const result = await verifyKey(apiKey, deviceId);
-    res.json(result);
+/* ================= RESET DEVICES ================= */
+app.post('/api/reset-key',authMiddleware,(req,res)=>{
+  const { key }=req.body;
+  const keys=loadKeys();
+  const found=keys.find(k=>k.key_code===key);
+  if(!found) return res.json({success:false});
+  found.devices=[];
+  saveKeys(keys);
+  res.json({success:true});
 });
 
-// ===== DELETE KEY =====
-app.delete("/delete/:key", checkAdmin, async (req, res) => {
-    let keys = await loadKeys();
-    keys = keys.filter(k => k.apiKey !== req.params.key);
-    await saveKeys(keys);
-    res.json({ message: "Deleted" });
+/* ================= DELETE KEY ================= */
+app.post('/api/delete-key',authMiddleware,(req,res)=>{
+  const { key }=req.body;
+  let keys=loadKeys();
+  keys=keys.filter(k=>k.key_code!==key);
+  saveKeys(keys);
+  res.json({success:true});
 });
 
-// ===== TOGGLE SERVER ON/OFF =====
-app.post("/server-toggle", checkAdmin, (req, res) => {
-    SERVER_ENABLED = !SERVER_ENABLED;
-    res.json({
-        serverEnabled: SERVER_ENABLED
-    });
+/* ================= LIST KEYS ================= */
+app.get('/api/list-keys',authMiddleware,(req,res)=>{
+  res.json(loadKeys());
 });
 
-app.get("/", (req, res) => {
-    res.json({
-        status: "Key API running",
-        serverEnabled: SERVER_ENABLED
-    });
+/* ================= HEALTH ================= */
+app.get('/health',(req,res)=>{
+  res.json({status:"ok",time:now()});
 });
 
-app.listen(PORT, () => {
-    console.log("Server running on port " + PORT);
+app.listen(PORT,()=>{
+  console.log("🔥 Single Owner Key System Running");
 });
