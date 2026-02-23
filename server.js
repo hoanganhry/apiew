@@ -1,157 +1,104 @@
-import express from "express";
-import cors from "cors";
-import fs from "fs-extra";
+const express = require("express");
+const fs = require("fs");
+const cors = require("cors");
 
 const app = express();
-const PORT = process.env.PORT || 3000;
-const DB_FILE = "./keys.json";
-
-// ===== ADMIN TOKEN =====
-const ADMIN_TOKEN = process.env.ADMIN_TOKEN || "123456"; // đổi nếu muốn
-let SERVER_ENABLED = true;
-
-app.use(cors());
 app.use(express.json());
+app.use(cors());
 
-if (!fs.existsSync(DB_FILE)) {
-    fs.writeJsonSync(DB_FILE, []);
+const PORT = process.env.PORT || 10000;
+const FILE = "keys.json";
+
+if (!fs.existsSync(FILE)) fs.writeFileSync(FILE, "[]");
+
+function loadKeys() {
+    return JSON.parse(fs.readFileSync(FILE));
 }
 
-async function loadKeys() {
-    return await fs.readJson(DB_FILE);
+function saveKeys(data) {
+    fs.writeFileSync(FILE, JSON.stringify(data, null, 2));
 }
 
-async function saveKeys(data) {
-    await fs.writeJson(DB_FILE, data, { spaces: 2 });
-}
-
-function generateKey(length = 12) {
+function generateKey() {
     const chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
-    let result = "";
-    for (let i = 0; i < length; i++) {
-        result += chars.charAt(Math.floor(Math.random() * chars.length));
+    let key = "";
+    for (let i = 0; i < 12; i++) {
+        key += chars[Math.floor(Math.random() * chars.length)];
     }
-    return result;
+    return key;
 }
 
-// ===== AUTO DELETE EXPIRED =====
-async function autoDeleteExpired() {
-    let keys = await loadKeys();
-    const now = new Date();
-    const valid = keys.filter(k => new Date(k.expiresAt) > now);
-    if (valid.length !== keys.length) {
-        await saveKeys(valid);
-    }
-}
-setInterval(autoDeleteExpired, 60000);
-
-// ===== ADMIN CHECK MIDDLEWARE =====
-function checkAdmin(req, res, next) {
-    const token = req.headers["x-admin-token"];
-    if (token !== ADMIN_TOKEN) {
-        return res.status(403).json({ error: "Invalid admin token" });
-    }
-    next();
+function calcExpire(duration, unit) {
+    const now = Date.now();
+    const map = {
+        hour: 3600000,
+        day: 86400000,
+        week: 604800000,
+        month: 2592000000
+    };
+    return now + duration * (map[unit] || map.day);
 }
 
-// ===== CREATE KEY =====
-app.post("/create", checkAdmin, async (req, res) => {
-    const { owner, duration, unit, deviceLimit, customKey } = req.body;
+setInterval(() => {
+    const keys = loadKeys();
+    const filtered = keys.filter(k => k.expiresAt > Date.now());
+    saveKeys(filtered);
+}, 60000);
 
-    if (!owner || !duration || !unit) {
-        return res.status(400).json({ error: "Missing data" });
-    }
-
-    let ms = 0;
-    if (unit === "hours") ms = duration * 3600000;
-    if (unit === "days") ms = duration * 86400000;
-    if (unit === "weeks") ms = duration * 7 * 86400000;
-    if (unit === "months") ms = duration * 30 * 86400000;
-
-    const expiresAt = new Date(Date.now() + ms);
-    const keys = await loadKeys();
-
-    let apiKey = customKey ? customKey.toUpperCase() : generateKey(12);
-
-    if (keys.find(k => k.apiKey === apiKey)) {
-        return res.status(400).json({ error: "Key already exists" });
-    }
+app.post("/create", (req, res) => {
+    const { duration, unit, deviceLimit, customKey } = req.body;
+    let keys = loadKeys();
 
     const newKey = {
-        apiKey,
-        owner,
-        createdAt: new Date().toISOString(),
-        expiresAt: expiresAt.toISOString(),
+        apiKey: customKey || generateKey(),
+        createdAt: Date.now(),
+        expiresAt: calcExpire(duration, unit),
         deviceLimit: deviceLimit || 1,
         devices: []
     };
 
     keys.push(newKey);
-    await saveKeys(keys);
+    saveKeys(keys);
 
     res.json(newKey);
 });
 
-// ===== VERIFY =====
-app.post("/verify", async (req, res) => {
-
-    if (!SERVER_ENABLED) {
-        return res.json({
-            valid: false,
-            message: "Server is under maintenance"
-        });
-    }
-
-    const { apiKey, deviceId } = req.body;
-
-    let keys = await loadKeys();
-    const key = keys.find(k => k.apiKey === apiKey);
-
-    if (!key) return res.json({ valid: false, message: "Invalid key" });
-
-    if (new Date(key.expiresAt) < new Date()) {
-        return res.json({ valid: false, message: "Expired" });
-    }
-
-    if (!key.devices.includes(deviceId)) {
-        if (key.devices.length >= key.deviceLimit) {
-            return res.json({ valid: false, message: "Device limit reached" });
-        }
-
-        key.devices.push(deviceId);
-        await saveKeys(keys);
-    }
-
-    res.json({
-        valid: true,
-        owner: key.owner,
-        expiresAt: key.expiresAt
-    });
+app.get("/list", (req, res) => {
+    res.json(loadKeys());
 });
 
-// ===== DELETE KEY =====
-app.delete("/delete/:key", checkAdmin, async (req, res) => {
-    let keys = await loadKeys();
+app.delete("/delete/:key", (req, res) => {
+    let keys = loadKeys();
     keys = keys.filter(k => k.apiKey !== req.params.key);
-    await saveKeys(keys);
-    res.json({ message: "Deleted" });
+    saveKeys(keys);
+    res.json({ success: true });
 });
 
-// ===== TOGGLE SERVER ON/OFF =====
-app.post("/server-toggle", checkAdmin, (req, res) => {
-    SERVER_ENABLED = !SERVER_ENABLED;
-    res.json({
-        serverEnabled: SERVER_ENABLED
-    });
-});
+app.post("/verify", (req, res) => {
+    const { key, deviceId } = req.body;
+    let keys = loadKeys();
+    const found = keys.find(k => k.apiKey === key);
 
-app.get("/", (req, res) => {
+    if (!found) return res.json({ success: false, message: "Key not found" });
+
+    if (found.expiresAt < Date.now())
+        return res.json({ success: false, message: "Expired" });
+
+    if (!found.devices.includes(deviceId)) {
+        if (found.devices.length >= found.deviceLimit)
+            return res.json({ success: false, message: "Device limit reached" });
+
+        found.devices.push(deviceId);
+        saveKeys(keys);
+    }
+
     res.json({
-        status: "Key API running",
-        serverEnabled: SERVER_ENABLED
+        success: true,
+        expiresAt: found.expiresAt,
+        devicesUsed: found.devices.length
     });
 });
 
 app.listen(PORT, () => {
-    console.log("Server running on port " + PORT);
+    console.log("Server running on port", PORT);
 });
