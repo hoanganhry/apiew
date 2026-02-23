@@ -1,16 +1,13 @@
 {
-  "name": "key-server",
+  "name": "simple-key-server",
   "version": "1.0.0",
-  "description": "API Key Management Server",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
   },
   "dependencies": {
     "cors": "^2.8.5",
-    "crypto": "^1.0.1",
     "express": "^4.18.2",
     "uuid": "^9.0.0"
   }
 }
-
