@@ -1,101 +1,147 @@
+// Simple Key Server - No Login Version
+
 const express = require("express");
 const cors = require("cors");
+const fs = require("fs");
+const path = require("path");
 const crypto = require("crypto");
 const { v4: uuidv4 } = require("uuid");
-const fs = require("fs");
 
 const app = express();
 app.use(cors());
 app.use(express.json());
 
-const PORT = 3000;
-const DB_FILE = "keys.json";
+const PORT = process.env.PORT || 10000;
+const DATA_FILE = path.join(__dirname, "keys.json");
+const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || "1";
 
-// Load database
-function loadDB() {
-    if (!fs.existsSync(DB_FILE)) return [];
-    return JSON.parse(fs.readFileSync(DB_FILE));
+/* ================= SAFE LOAD/SAVE ================= */
+
+function loadKeys() {
+  if (!fs.existsSync(DATA_FILE)) return [];
+  return JSON.parse(fs.readFileSync(DATA_FILE, "utf8"));
 }
 
-// Save database
-function saveDB(data) {
-    fs.writeFileSync(DB_FILE, JSON.stringify(data, null, 2));
+function saveKeys(data) {
+  fs.writeFileSync(DATA_FILE, JSON.stringify(data, null, 2));
 }
 
-// Tạo key mã hóa
 function generateKey() {
-    return crypto.randomBytes(16).toString("hex").toUpperCase();
+  return "KEY-" + crypto.randomBytes(8).toString("hex").toUpperCase();
 }
 
-// =============================
-// TẠO KEY
-// =============================
+/* ================= ROOT ================= */
+
+app.get("/", (req, res) => {
+  res.json({
+    name: "Simple Key API",
+    status: "online"
+  });
+});
+
+/* ================= CREATE KEY ================= */
+
 app.post("/api/create-key", (req, res) => {
-    const { days } = req.body;
+  const { password, days, devices } = req.body;
 
-    if (!days) {
-        return res.json({ success: false, message: "Thiếu số ngày" });
-    }
+  if (password !== ADMIN_PASSWORD) {
+    return res.status(403).json({ success: false, message: "Sai mật khẩu admin" });
+  }
 
-    const db = loadDB();
+  if (!days || !devices) {
+    return res.json({ success: false, message: "Thiếu days hoặc devices" });
+  }
 
-    const newKey = {
-        id: uuidv4(),
-        key: generateKey(),
-        createdAt: Date.now(),
-        expiresAt: Date.now() + days * 24 * 60 * 60 * 1000,
-        deviceId: null
-    };
+  const keys = loadKeys();
 
-    db.push(newKey);
-    saveDB(db);
+  const newKey = {
+    id: uuidv4(),
+    key_code: generateKey(),
+    created_at: new Date().toISOString(),
+    expires_at: new Date(Date.now() + days * 86400000).toISOString(),
+    allowed_devices: Number(devices),
+    devices: [],
+    total_verifications: 0
+  };
 
-    res.json({
-        success: true,
-        key: newKey.key,
-        expiresAt: new Date(newKey.expiresAt)
-    });
+  keys.push(newKey);
+  saveKeys(keys);
+
+  res.json({ success: true, key: newKey });
 });
 
-// =============================
-// VERIFY KEY
-// =============================
+/* ================= VERIFY KEY ================= */
+
 app.post("/api/verify-key", (req, res) => {
-    const { key, deviceId } = req.body;
+  const { key, device_id } = req.body;
 
-    if (!key || !deviceId) {
-        return res.json({ success: false, message: "Thiếu key hoặc deviceId" });
+  if (!key || !device_id) {
+    return res.status(400).json({ success: false, message: "Thiếu key hoặc device_id" });
+  }
+
+  const keys = loadKeys();
+  const found = keys.find(k => k.key_code === key);
+
+  if (!found) {
+    return res.status(404).json({ success: false, message: "Key không tồn tại" });
+  }
+
+  if (new Date(found.expires_at) < new Date()) {
+    return res.json({ success: false, message: "Key đã hết hạn" });
+  }
+
+  if (!found.devices.includes(device_id)) {
+    if (found.devices.length >= found.allowed_devices) {
+      return res.json({
+        success: false,
+        message: "Đã đạt giới hạn thiết bị"
+      });
     }
 
-    const db = loadDB();
-    const found = db.find(k => k.key === key);
+    found.devices.push(device_id);
+  }
 
-    if (!found) {
-        return res.json({ success: false, message: "Key không tồn tại" });
-    }
+  found.total_verifications++;
+  saveKeys(keys);
 
-    if (Date.now() > found.expiresAt) {
-        return res.json({ success: false, message: "Key đã hết hạn" });
-    }
-
-    // Nếu chưa kích hoạt thiết bị
-    if (!found.deviceId) {
-        found.deviceId = deviceId;
-        saveDB(db);
-    }
-
-    // Nếu key đã gắn thiết bị khác
-    if (found.deviceId !== deviceId) {
-        return res.json({ success: false, message: "Key đã được sử dụng trên thiết bị khác" });
-    }
-
-    res.json({
-        success: true,
-        message: "Key hợp lệ",
-        expiresAt: new Date(found.expiresAt)
-    });
+  res.json({
+    success: true,
+    message: "Xác thực thành công",
+    expires_at: found.expires_at,
+    devices_remaining: found.allowed_devices - found.devices.length
+  });
 });
+
+/* ================= LIST KEYS (ADMIN) ================= */
+
+app.get("/api/list-keys", (req, res) => {
+  const password = req.query.password;
+
+  if (password !== ADMIN_PASSWORD) {
+    return res.status(403).json({ success: false, message: "Sai mật khẩu admin" });
+  }
+
+  res.json(loadKeys());
+});
+
+/* ================= DELETE KEY ================= */
+
+app.post("/api/delete-key", (req, res) => {
+  const { password, key } = req.body;
+
+  if (password !== ADMIN_PASSWORD) {
+    return res.status(403).json({ success: false, message: "Sai mật khẩu admin" });
+  }
+
+  let keys = loadKeys();
+  keys = keys.filter(k => k.key_code !== key);
+  saveKeys(keys);
+
+  res.json({ success: true, message: "Đã xóa key" });
+});
+
+/* ================= SERVER START ================= */
 
 app.listen(PORT, () => {
-    console.log("Server running on port " + PORT);
+  console.log("Simple Key API running on port " + PORT);
 });
