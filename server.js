@@ -10,6 +10,7 @@ const { v4: uuidv4 } = require("uuid");
 const app = express();
 app.use(cors());
 app.use(express.json());
+app.use(express.static("public"));
 
 const PORT = process.env.PORT || 10000;
 const DATA_FILE = path.join(__dirname, "keys.json");
@@ -33,19 +34,28 @@ function generateKey() {
 /* ================= ROOT ================= */
 
 app.get("/", (req, res) => {
-  res.sendFile(path.join(__dirname, "admin.html"));
+  res.json({
+    name: "Simple Key API",
+    status: "online",
+    version: "1.0.0",
+    endpoints: {
+      "POST /api/create-key": "Tạo key mới",
+      "POST /api/verify-key": "Xác thực key",
+      "GET /api/list-keys": "Liệt kê keys",
+      "POST /api/delete-key": "Xóa key"
+    }
+  });
 });
 
 app.get("/api", (req, res) => {
   res.json({
     name: "Simple Key API",
     status: "online",
-    admin_panel: "/",
     endpoints: {
-      "POST /api/create-key": "Tạo key mới (cần password)",
+      "POST /api/create-key": "Tạo key mới",
       "POST /api/verify-key": "Xác thực key",
-      "GET /api/list-keys": "Liệt kê keys (cần password)",
-      "POST /api/delete-key": "Xóa key (cần password)"
+      "GET /api/list-keys": "Liệt kê keys",
+      "POST /api/delete-key": "Xóa key"
     }
   });
 });
@@ -207,3 +217,4 @@ app.post("/api/delete-key", (req, res) => {
 app.listen(PORT, () => {
   console.log("Simple Key API running on port " + PORT);
 });
+
