@@ -1,18 +1,26 @@
 {
-  "name": "anthropic-proxy-server",
-  "version": "1.0.0",
-  "description": "Proxy server bảo vệ Anthropic API key",
-  "type": "module",
-  "main": "server.js",
+  "name": "auth-api-v4",
+  "version": "4.0.0",
+  "description": "AuthAPI v4.0 - Open Key System (No Login Required)",
+  "main": "server_key_auth_api.js",
   "scripts": {
-    "start": "node server.js",
-    "dev": "node --watch server.js"
+    "start": "node server_key_auth_api.js",
+    "dev": "nodemon server_key_auth_api.js"
   },
   "dependencies": {
+    "bcrypt": "^5.1.1",
+    "body-parser": "^1.20.2",
     "cors": "^2.8.5",
-    "express": "^4.18.2"
+    "express": "^4.18.2",
+    "jsonwebtoken": "^9.0.2",
+    "uuid": "^9.0.0"
+  },
+  "devDependencies": {
+    "nodemon": "^3.0.2"
   },
   "engines": {
-    "node": ">=18.0.0"
-  }
+    "node": ">=16.0.0"
+  },
+  "author": "",
+  "license": "MIT"
 }
