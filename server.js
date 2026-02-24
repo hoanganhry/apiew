@@ -378,7 +378,10 @@ app.get('/api/list-keys', requireAdmin, (req, res) => {
 /* ================= VERIFY KEY (PUBLIC) ================= */
 app.post('/api/verify-key', (req, res) => {
   try {
-    const { key, device_id } = req.body || {};
+    const body = req.body || {};
+    // Tương thích cả snake_case (v4) lẫn camelCase (v3 cũ từ iOS)
+    const key       = body.key       || body.apiKey   || null;
+    const device_id = body.device_id || body.deviceId || null;
 
     if (!key || !device_id) {
       return res.status(400).json({
@@ -733,4 +736,3 @@ const server = app.listen(PORT, () => {
 
 process.on('SIGTERM', () => { createBackup(); server.close(() => process.exit(0)); });
 process.on('SIGINT', () => { createBackup(); server.close(() => process.exit(0)); });
-
