@@ -2,10 +2,10 @@
   "name": "auth-api-v4",
   "version": "4.0.0",
   "description": "AuthAPI v4.0 - Open Key System (No Login Required)",
-  "main": "server_key_auth_api.js",
+  "main": "server.js",
   "scripts": {
-    "start": "node server_key_auth_api.js",
-    "dev": "nodemon server_key_auth_api.js"
+    "start": "node server.js",
+    "dev": "node server.js"
   },
   "dependencies": {
     "bcrypt": "^5.1.1",
@@ -14,9 +14,6 @@
     "express": "^4.18.2",
     "jsonwebtoken": "^9.0.2",
     "uuid": "^9.0.0"
-  },
-  "devDependencies": {
-    "nodemon": "^3.0.2"
   },
   "engines": {
     "node": ">=16.0.0"
