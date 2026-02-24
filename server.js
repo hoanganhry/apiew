@@ -31,7 +31,6 @@ app.use((err, req, res, next) => {
 /* ================= MIDDLEWARE ================= */
 app.use(cors());
 app.use(bodyParser.json());
-app.use(express.static('public'));
 
 app.use((req, res, next) => {
   console.log(`[${new Date().toISOString()}] ${req.method} ${req.path}`);
@@ -683,10 +682,6 @@ app.get('/api/contact', (req, res) => {
 });
 
 /* ================= API INFO ================= */
-app.get('/', (req, res) => {
-  res.sendFile(path.join(__dirname, 'public', 'index.html'));
-});
-
 app.get('/api', (req, res) => {
   const config = loadConfig();
   res.json({
@@ -736,3 +731,4 @@ const server = app.listen(PORT, () => {
 
 process.on('SIGTERM', () => { createBackup(); server.close(() => process.exit(0)); });
 process.on('SIGINT', () => { createBackup(); server.close(() => process.exit(0)); });
+
