@@ -43,9 +43,11 @@ const DATA_DIR = process.env.DATA_DIR || __dirname;
 const DATA_FILE = path.join(DATA_DIR, 'keys.json');
 const CONFIG_FILE = path.join(DATA_DIR, 'config.json');
 const LOGS_FILE = path.join(DATA_DIR, 'activity_logs.json');
+const TOKEN_PACKS_FILE = path.join(DATA_DIR, 'token_packs.json');
 const BACKUP_DIR = path.join(DATA_DIR, 'backups');
 
 const HMAC_SECRET = process.env.HMAC_SECRET || 'please-change-hmac-secret-2025';
+const TOKEN_PACK_SECRET = process.env.TOKEN_PACK_SECRET || 'token-pack-secret-2025';
 
 /* ================= BACKUP SYSTEM ================= */
 if (!fs.existsSync(BACKUP_DIR)) {
@@ -128,6 +130,11 @@ if (!fs.existsSync(LOGS_FILE)) {
   console.log('✅ Initialized activity_logs.json');
 }
 
+if (!fs.existsSync(TOKEN_PACKS_FILE)) {
+  safeSaveJSON(TOKEN_PACKS_FILE, []);
+  console.log('✅ Initialized token_packs.json');
+}
+
 if (!fs.existsSync(CONFIG_FILE)) {
   const adminPassword = process.env.ADMIN_PASSWORD || '1';
   const hash = bcrypt.hashSync(adminPassword, 10);
@@ -160,6 +167,19 @@ function loadConfig() {
 function saveConfig(config) { return safeSaveJSON(CONFIG_FILE, config); }
 function loadLogs() { return safeLoadJSON(LOGS_FILE, []); }
 function saveLogs(logs) { return safeSaveJSON(LOGS_FILE, logs); }
+function loadTokenPacks() { return safeLoadJSON(TOKEN_PACKS_FILE, []); }
+function saveTokenPacks(packs) { return safeSaveJSON(TOKEN_PACKS_FILE, packs); }
+
+function getDetailedDateTime() {
+  const now = new Date();
+  return {
+    iso: now.toISOString(),
+    date: now.toLocaleDateString('vi-VN'),
+    time: now.toLocaleTimeString('vi-VN'),
+    timestamp: now.getTime(),
+    unix: Math.floor(now.getTime() / 1000)
+  };
+}
 
 /* ================= ACTIVITY LOGGING ================= */
 function logActivity(action, actor, details = {}) {
@@ -283,7 +303,11 @@ app.post('/api/create-key', (req, res) => {
       owner: isAdmin ? 'admin' : 'public',
       total_verifications: 0,
       last_verified: null,
-      is_custom: !!customKey
+      is_custom: !!customKey,
+      seen: false,
+      seen_at: null,
+      seen_count: 0,
+      updated_at: createdAt
     };
 
     keys.push(record);
@@ -340,7 +364,11 @@ app.post('/api/bulk-create-keys', (req, res) => {
         devices: [],
         owner: isAdmin ? 'admin' : 'public',
         total_verifications: 0,
-        last_verified: null
+        last_verified: null,
+        seen: false,
+        seen_at: null,
+        seen_count: 0,
+        updated_at: createdAt
       };
 
       keys.push(record);
@@ -437,6 +465,9 @@ app.post('/api/verify-key', (req, res) => {
 
     found.total_verifications = (found.total_verifications || 0) + 1;
     found.last_verified = new Date().toISOString();
+    found.seen = true;
+    found.seen_at = getDetailedDateTime();
+    found.seen_count = (found.seen_count || 0) + 1;
     saveKeys(keys);
 
     res.json({
@@ -444,7 +475,9 @@ app.post('/api/verify-key', (req, res) => {
       message: 'Xác thực thành công',
       type: found.type,
       expires_at: found.expires_at,
-      devices_remaining: found.allowed_devices - found.devices.length
+      devices_remaining: found.allowed_devices - found.devices.length,
+      verified_at: found.last_verified,
+      total_verifications: found.total_verifications
     });
   } catch(err) {
     console.error('Verify error:', err);
@@ -489,7 +522,11 @@ app.post('/api/key-info', (req, res) => {
         devices_allowed: found.allowed_devices,
         total_verifications: found.total_verifications || 0,
         last_verified: found.last_verified || 'Never',
-        is_custom: found.is_custom || false
+        is_custom: found.is_custom || false,
+        seen: found.seen || false,
+        seen_at: found.seen_at || null,
+        seen_count: found.seen_count || 0,
+        updated_at: found.updated_at || found.created_at
       }
     });
   } catch(err) {
@@ -512,11 +549,12 @@ app.post('/api/extend-key', (req, res) => {
     found.expires_at = new Date(
       new Date(found.expires_at).getTime() + days * 86400000
     ).toISOString();
+    found.updated_at = getDetailedDateTime();
 
     saveKeys(keys);
     logActivity('extend_key', 'public', { keyCode: key, days, ip: req.ip });
 
-    res.json({ success: true, message: 'Gia hạn key thành công', new_expires_at: found.expires_at });
+    res.json({ success: true, message: 'Gia hạn key thành công', new_expires_at: found.expires_at, updated_at: found.updated_at });
   } catch(err) {
     console.error('Extend key error:', err);
     res.status(500).json({ success: false, message: 'Server error' });
@@ -536,13 +574,83 @@ app.post('/api/reset-key', (req, res) => {
 
     const oldDevices = found.devices.length;
     found.devices = [];
+    found.updated_at = getDetailedDateTime();
     saveKeys(keys);
 
     logActivity('reset_key', 'public', { keyCode: key, devicesCleared: oldDevices, ip: req.ip });
 
-    res.json({ success: true, message: 'Reset thiết bị thành công' });
+    res.json({ success: true, message: 'Reset thiết bị thành công', updated_at: found.updated_at });
   } catch(err) {
     console.error('Reset key error:', err);
+    res.status(500).json({ success: false, message: 'Server error' });
+  }
+});
+
+/* ================= UPDATE KEY TIME (PUBLIC) ================= */
+app.post('/api/update-key-time', (req, res) => {
+  try {
+    const { key, days, new_expiration_date } = req.body || {};
+    const keys = loadKeys();
+    const found = keys.find(k => k.key_code === key);
+
+    if (!found) {
+      return res.status(404).json({ success: false, message: 'Key không tồn tại' });
+    }
+
+    if (new_expiration_date) {
+      found.expires_at = new Date(new_expiration_date).toISOString();
+    } else if (days) {
+      found.expires_at = new Date(
+        new Date(found.expires_at).getTime() + days * 86400000
+      ).toISOString();
+    } else {
+      return res.status(400).json({ success: false, message: 'Vui lòng cung cấp days hoặc new_expiration_date' });
+    }
+
+    found.updated_at = getDetailedDateTime();
+    saveKeys(keys);
+    logActivity('update_key_time', 'public', { keyCode: key, newExpires: found.expires_at, ip: req.ip });
+
+    res.json({
+      success: true,
+      message: 'Cập nhật thời gian key thành công',
+      new_expires_at: found.expires_at,
+      updated_at: found.updated_at
+    });
+  } catch(err) {
+    console.error('Update key time error:', err);
+    res.status(500).json({ success: false, message: 'Server error' });
+  }
+});
+
+/* ================= CHECK KEY SEEN STATUS ================= */
+app.post('/api/check-key-seen', (req, res) => {
+  try {
+    const { key } = req.body || {};
+
+    if (!key) {
+      return res.status(400).json({ success: false, message: 'Thiếu key' });
+    }
+
+    const keys = loadKeys();
+    const found = keys.find(k => k.key_code === key);
+
+    if (!found) {
+      return res.status(404).json({ success: false, message: 'Key không tồn tại' });
+    }
+
+    res.json({
+      success: true,
+      key: found.key_code,
+      seen: found.seen || false,
+      seen_count: found.seen_count || 0,
+      first_seen_at: found.seen_at || null,
+      last_verified: found.last_verified || null,
+      created_at: found.created_at,
+      updated_at: found.updated_at || found.created_at
+    });
+  } catch(err) {
+    console.error('Check key seen error:', err);
     res.status(500).json({ success: false, message: 'Server error' });
   }
 });
@@ -671,6 +779,105 @@ app.post('/api/admin-login', (req, res) => {
   }
 });
 
+/* ================= TOKEN PACK SYSTEM (For Server Updates) ================= */
+app.post('/api/create-token-pack', requireAdmin, (req, res) => {
+  try {
+    const { name, purpose, valid_for_hours } = req.body || {};
+
+    if (!name || !purpose) {
+      return res.status(400).json({ success: false, message: 'Thiếu name hoặc purpose' });
+    }
+
+    const token = crypto.randomBytes(32).toString('hex');
+    const packs = loadTokenPacks();
+    const expiresAt = new Date(Date.now() + (valid_for_hours || 24) * 3600000).toISOString();
+
+    const pack = {
+      id: uuidv4(),
+      token,
+      name,
+      purpose,
+      created_at: getDetailedDateTime(),
+      expires_at: expiresAt,
+      valid_for_hours: valid_for_hours || 24,
+      used: false,
+      used_at: null,
+      created_by: 'admin'
+    };
+
+    packs.push(pack);
+    saveTokenPacks(packs);
+    logActivity('create_token_pack', 'admin', { name, purpose, token: token.substring(0, 10) + '...', ip: req.ip });
+
+    res.json({
+      success: true,
+      message: 'Tạo token pack thành công',
+      token_pack: pack
+    });
+  } catch(err) {
+    console.error('Create token pack error:', err);
+    res.status(500).json({ success: false, message: 'Server error' });
+  }
+});
+
+app.post('/api/use-token-pack', (req, res) => {
+  try {
+    const { token } = req.body || {};
+
+    if (!token) {
+      return res.status(400).json({ success: false, message: 'Thiếu token' });
+    }
+
+    const packs = loadTokenPacks();
+    const found = packs.find(p => p.token === token);
+
+    if (!found) {
+      return res.status(404).json({ success: false, message: 'Token pack không tồn tại' });
+    }
+
+    if (found.used) {
+      return res.status(400).json({
+        success: false,
+        message: 'Token pack đã được sử dụng',
+        used_at: found.used_at
+      });
+    }
+
+    if (new Date(found.expires_at) < new Date()) {
+      return res.status(400).json({
+        success: false,
+        message: 'Token pack đã hết hạn',
+        expired_at: found.expires_at
+      });
+    }
+
+    found.used = true;
+    found.used_at = getDetailedDateTime();
+    saveTokenPacks(packs);
+    logActivity('use_token_pack', 'admin', { packId: found.id, purpose: found.purpose, ip: req.ip });
+
+    res.json({
+      success: true,
+      message: 'Token pack hợp lệ - Phép cập nhật server được cấp',
+      token_pack: found,
+      authorization: 'SERVER_UPDATE_AUTHORIZED'
+    });
+  } catch(err) {
+    console.error('Use token pack error:', err);
+    res.status(500).json({ success: false, message: 'Server error' });
+  }
+});
+
+app.get('/api/admin/token-packs', requireAdmin, (req, res) => {
+  try {
+    const packs = loadTokenPacks();
+    const limit = parseInt(req.query.limit) || 50;
+    res.json(packs.slice(-limit).reverse());
+  } catch(err) {
+    res.status(500).json({ success: false, message: 'Server error' });
+  }
+});
+
 /* ================= CONTACT INFO ================= */
 app.get('/api/contact', (req, res) => {
   try {
@@ -695,6 +902,10 @@ app.get('/api', (req, res) => {
       "✅ Bulk create (1-100 keys)",
       "✅ Custom key code",
       "✅ Verify key theo device",
+      "✅ Theo dõi xem key (seen status)",
+      "✅ Cập nhật thời gian key",
+      "✅ Token pack cho update server",
+      "✅ Chi tiết ngày/giờ/tháng",
       "💾 Auto backup mỗi 6 giờ",
       "📊 Activity logging",
       "🔐 HMAC signature verification",
@@ -731,4 +942,5 @@ const server = app.listen(PORT, () => {
 
 process.on('SIGTERM', () => { createBackup(); server.close(() => process.exit(0)); });
 process.on('SIGINT', () => { createBackup(); server.close(() => process.exit(0)); });
+
 
