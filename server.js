@@ -40,11 +40,12 @@ app.use((req, res, next) => {
 /* ================= CONSTANTS ================= */
 const PORT = process.env.PORT || 10000;
 const DATA_DIR = process.env.DATA_DIR || __dirname;
-const DATA_FILE = path.join(DATA_DIR, 'keys.json');
-const TOKENS_FILE = path.join(DATA_DIR, 'tokens.json');
-const CONFIG_FILE = path.join(DATA_DIR, 'config.json');
-const LOGS_FILE = path.join(DATA_DIR, 'activity_logs.json');
-const BACKUP_DIR = path.join(DATA_DIR, 'backups');
+const DATA_FILE     = path.join(DATA_DIR, 'keys.json');
+const PACKAGES_FILE = path.join(DATA_DIR, 'packages.json');
+const TOKENS_FILE   = path.join(DATA_DIR, 'tokens.json');
+const CONFIG_FILE   = path.join(DATA_DIR, 'config.json');
+const LOGS_FILE     = path.join(DATA_DIR, 'activity_logs.json');
+const BACKUP_DIR    = path.join(DATA_DIR, 'backups');
 
 const HMAC_SECRET = process.env.HMAC_SECRET || 'please-change-hmac-secret-2025';
 
@@ -61,7 +62,7 @@ function createBackup() {
     if (!fs.existsSync(backupSubDir)) {
       fs.mkdirSync(backupSubDir, { recursive: true });
     }
-    [DATA_FILE, CONFIG_FILE, LOGS_FILE, TOKENS_FILE].forEach(file => {
+    [DATA_FILE, CONFIG_FILE, LOGS_FILE, PACKAGES_FILE, TOKENS_FILE].forEach(file => {
       if (fs.existsSync(file)) {
         fs.copyFileSync(file, path.join(backupSubDir, path.basename(file)));
       }
@@ -123,7 +124,10 @@ if (!fs.existsSync(DATA_FILE)) {
   safeSaveJSON(DATA_FILE, []);
   console.log('✅ Initialized keys.json');
 }
-
+if (!fs.existsSync(PACKAGES_FILE)) {
+  safeSaveJSON(PACKAGES_FILE, []);
+  console.log('✅ Initialized packages.json');
+}
 if (!fs.existsSync(TOKENS_FILE)) {
   safeSaveJSON(TOKENS_FILE, []);
   console.log('✅ Initialized tokens.json');
@@ -166,11 +170,14 @@ function loadConfig() {
 function saveConfig(config) { return safeSaveJSON(CONFIG_FILE, config); }
 function loadLogs() { return safeLoadJSON(LOGS_FILE, []); }
 function saveLogs(logs) { return safeSaveJSON(LOGS_FILE, logs); }
+function loadPackages() { return safeLoadJSON(PACKAGES_FILE, []); }
+function savePackages(pkgs) { return safeSaveJSON(PACKAGES_FILE, pkgs); }
 function loadTokens() { return safeLoadJSON(TOKENS_FILE, []); }
 function saveTokens(tokens) { return safeSaveJSON(TOKENS_FILE, tokens); }
 
-function generateTokenCode() {
-  return `TOKEN-${randomChunk(6)}-${randomChunk(4)}-${randomChunk(4)}`;
+function genCode(prefix) {
+  const chunk = (n) => Math.random().toString(36).substring(2, 2+n).toUpperCase();
+  return `${prefix}-${chunk(6)}-${chunk(4)}`;
 }
 
 /* ================= ACTIVITY LOGGING ================= */
@@ -413,26 +420,6 @@ app.post('/api/verify-key', (req, res) => {
       });
     }
 
-    // Check token status
-    if (found.token_id) {
-      const tokens = loadTokens();
-      const token = tokens.find(t => t.id === found.token_id);
-      if (token && token.status === 'disabled') {
-        return res.json({
-          success: false,
-          message: 'Token chứa key này đã bị vô hiệu hóa',
-          error_code: 'TOKEN_DISABLED'
-        });
-      }
-      if (token && token.expires_at && new Date(token.expires_at) < new Date()) {
-        return res.json({
-          success: false,
-          message: 'Token chứa key này đã hết hạn',
-          error_code: 'TOKEN_EXPIRED'
-        });
-      }
-    }
-
     // Verify signature
     const expectedSig = signValue(found.key_code);
     if (expectedSig !== found.signature) {
@@ -441,6 +428,22 @@ app.post('/api/verify-key', (req, res) => {
         message: 'Chữ ký không khớp',
         error_code: 'SIGNATURE_MISMATCH'
       });
+    }
+
+    // ── Check Package status ──
+    if (found.package_id) {
+      const pkg = loadPackages().find(p => p.id === found.package_id);
+      if (pkg && pkg.status === 'disabled') {
+        return res.json({ success: false, message: 'Package đã bị vô hiệu hóa', error_code: 'PACKAGE_DISABLED' });
+      }
+    }
+
+    // ── Check Token status ──
+    if (found.token_id) {
+      const tok = loadTokens().find(t => t.id === found.token_id);
+      if (tok && tok.status === 'disabled') {
+        return res.json({ success: false, message: 'Token đã bị vô hiệu hóa', error_code: 'TOKEN_DISABLED' });
+      }
     }
 
     // Check expiry
@@ -741,190 +744,199 @@ app.get('/health', (req, res) => {
   res.json({ status: 'ok', timestamp: new Date().toISOString(), uptime: process.uptime() });
 });
 
-/* ================= TOKEN SYSTEM ================= */
+/* ═══════════════════════════════════════════════════
+   PACKAGE SYSTEM  (nhóm cha cấp 1)
+═══════════════════════════════════════════════════ */
 
-/* CREATE TOKEN (ADMIN) */
+// Tạo package
+app.post('/api/package/create', requireAdmin, (req, res) => {
+  try {
+    const { name, note } = req.body || {};
+    if (!name?.trim()) return res.status(400).json({ success: false, message: 'Vui lòng đặt tên package' });
+    const pkgs = loadPackages();
+    const pkg  = { id: uuidv4(), package_code: genCode('PKG'), name: name.trim(), note: note?.trim() || '', status: 'active', created_at: new Date().toISOString() };
+    pkgs.push(pkg);
+    savePackages(pkgs);
+    logActivity('create_package', 'admin', { packageCode: pkg.package_code, name, ip: req.ip });
+    res.json({ success: true, package: pkg });
+  } catch(e) { res.status(500).json({ success: false, message: 'Server error' }); }
+});
+
+// Danh sách packages (kèm số token + số key)
+app.get('/api/package/list', requireAdmin, (req, res) => {
+  try {
+    const pkgs   = loadPackages();
+    const tokens = loadTokens();
+    const keys   = loadKeys();
+    const result = pkgs.map(p => ({
+      ...p,
+      token_count: tokens.filter(t => t.package_id === p.id).length,
+      key_count:   keys.filter(k => k.package_id === p.id).length
+    }));
+    res.json({ success: true, packages: result });
+  } catch(e) { res.status(500).json({ success: false, message: 'Server error' }); }
+});
+
+// Bật / tắt package → khóa/mở toàn bộ token + key bên trong
+app.post('/api/package/toggle', requireAdmin, (req, res) => {
+  try {
+    const { package_id } = req.body || {};
+    const pkgs = loadPackages();
+    const pkg  = pkgs.find(p => p.id === package_id);
+    if (!pkg) return res.status(404).json({ success: false, message: 'Không tìm thấy package' });
+    pkg.status = pkg.status === 'active' ? 'disabled' : 'active';
+    savePackages(pkgs);
+    const keys   = loadKeys();
+    const tokens = loadTokens();
+    const aKeys  = keys.filter(k => k.package_id === package_id).length;
+    const aToks  = tokens.filter(t => t.package_id === package_id).length;
+    logActivity('toggle_package', 'admin', { packageId: package_id, status: pkg.status, affectedTokens: aToks, affectedKeys: aKeys, ip: req.ip });
+    res.json({ success: true, message: pkg.status === 'active' ? `Đã kích hoạt — ${aToks} token, ${aKeys} key được mở` : `Đã tắt — ${aToks} token, ${aKeys} key bị khóa`, package: pkg });
+  } catch(e) { res.status(500).json({ success: false, message: 'Server error' }); }
+});
+
+// Xóa package
+app.post('/api/package/delete', requireAdmin, (req, res) => {
+  try {
+    const { package_id, delete_children } = req.body || {};
+    let pkgs = loadPackages();
+    if (!pkgs.find(p => p.id === package_id)) return res.status(404).json({ success: false, message: 'Không tìm thấy package' });
+    pkgs = pkgs.filter(p => p.id !== package_id);
+    savePackages(pkgs);
+    if (delete_children) {
+      let tokens = loadTokens(); const removedToks = tokens.filter(t => t.package_id === package_id).length;
+      tokens = tokens.filter(t => t.package_id !== package_id); saveTokens(tokens);
+      let keys = loadKeys(); const removedKeys = keys.filter(k => k.package_id === package_id).length;
+      keys = keys.filter(k => k.package_id !== package_id); saveKeys(keys);
+      logActivity('delete_package', 'admin', { package_id, removedToks, removedKeys, ip: req.ip });
+      return res.json({ success: true, message: `Đã xóa package, ${removedToks} token và ${removedKeys} key` });
+    }
+    logActivity('delete_package', 'admin', { package_id, ip: req.ip });
+    res.json({ success: true, message: 'Đã xóa package' });
+  } catch(e) { res.status(500).json({ success: false, message: 'Server error' }); }
+});
+
+/* ═══════════════════════════════════════════════════
+   TOKEN SYSTEM  (con của Package)
+═══════════════════════════════════════════════════ */
+
+// Tạo token (bắt buộc thuộc 1 package)
 app.post('/api/token/create', requireAdmin, (req, res) => {
   try {
-    const { name, note, days } = req.body || {};
-    if (!name || !name.trim()) {
-      return res.status(400).json({ success: false, message: 'Vui lòng đặt tên cho token' });
-    }
+    const { package_id, name, note, days } = req.body || {};
+    if (!package_id) return res.status(400).json({ success: false, message: 'Thiếu package_id' });
+    const pkg = loadPackages().find(p => p.id === package_id);
+    if (!pkg) return res.status(404).json({ success: false, message: 'Không tìm thấy package' });
+    if (!name?.trim()) return res.status(400).json({ success: false, message: 'Vui lòng đặt tên token' });
     const tokens = loadTokens();
-    const tokenCode = generateTokenCode();
-    const now = new Date().toISOString();
-    const expiresAt = days
-      ? new Date(Date.now() + Number(days) * 86400000).toISOString()
-      : null;
-
-    const token = {
-      id: uuidv4(),
-      token_code: tokenCode,
-      name: name.trim(),
-      note: note ? note.trim() : '',
-      status: 'active',        // 'active' | 'disabled'
-      created_at: now,
-      expires_at: expiresAt,
-      key_count: 0
+    const token  = {
+      id: uuidv4(), token_code: genCode('TOKEN'),
+      package_id, package_name: pkg.name,
+      name: name.trim(), note: note?.trim() || '',
+      status: 'active',
+      created_at: new Date().toISOString(),
+      expires_at: days ? new Date(Date.now() + Number(days)*86400000).toISOString() : null
     };
     tokens.push(token);
     saveTokens(tokens);
-    logActivity('create_token', 'admin', { tokenCode, name, ip: req.ip });
+    logActivity('create_token', 'admin', { tokenCode: token.token_code, packageId: package_id, ip: req.ip });
     res.json({ success: true, token });
-  } catch (err) {
-    console.error('Create token error:', err);
-    res.status(500).json({ success: false, message: 'Server error' });
-  }
+  } catch(e) { res.status(500).json({ success: false, message: 'Server error' }); }
 });
 
-/* LIST TOKENS (ADMIN) */
+// Danh sách token (có thể lọc theo package)
 app.get('/api/token/list', requireAdmin, (req, res) => {
   try {
+    const { package_id } = req.query;
     const tokens = loadTokens();
-    const keys = loadKeys();
-    const result = tokens.map(t => ({
+    const keys   = loadKeys();
+    const result = (package_id ? tokens.filter(t => t.package_id === package_id) : tokens).map(t => ({
       ...t,
       key_count: keys.filter(k => k.token_id === t.id).length
     }));
     res.json({ success: true, tokens: result });
-  } catch (err) {
-    res.status(500).json({ success: false, message: 'Server error' });
-  }
+  } catch(e) { res.status(500).json({ success: false, message: 'Server error' }); }
 });
 
-/* TOGGLE TOKEN STATUS (enable/disable) */
+// Bật / tắt token → khóa/mở key bên trong
 app.post('/api/token/toggle', requireAdmin, (req, res) => {
   try {
     const { token_id } = req.body || {};
     const tokens = loadTokens();
-    const token = tokens.find(t => t.id === token_id);
+    const token  = tokens.find(t => t.id === token_id);
     if (!token) return res.status(404).json({ success: false, message: 'Không tìm thấy token' });
-
     token.status = token.status === 'active' ? 'disabled' : 'active';
-    token.toggled_at = new Date().toISOString();
     saveTokens(tokens);
-
-    const keys = loadKeys();
-    const affectedKeys = keys.filter(k => k.token_id === token_id).length;
-
-    logActivity('toggle_token', 'admin', { tokenId: token_id, newStatus: token.status, affectedKeys, ip: req.ip });
-    res.json({
-      success: true,
-      message: token.status === 'active' ? `Đã kích hoạt token — ${affectedKeys} key được mở` : `Đã vô hiệu hóa token — ${affectedKeys} key bị khóa`,
-      token,
-      affected_keys: affectedKeys
-    });
-  } catch (err) {
-    res.status(500).json({ success: false, message: 'Server error' });
-  }
+    const affected = loadKeys().filter(k => k.token_id === token_id).length;
+    logActivity('toggle_token', 'admin', { token_id, status: token.status, affected, ip: req.ip });
+    res.json({ success: true, message: token.status === 'active' ? `Đã bật — ${affected} key được mở` : `Đã tắt — ${affected} key bị khóa`, token, affected_keys: affected });
+  } catch(e) { res.status(500).json({ success: false, message: 'Server error' }); }
 });
 
-/* DELETE TOKEN (and all its keys) */
+// Xóa token
 app.post('/api/token/delete', requireAdmin, (req, res) => {
   try {
     const { token_id, delete_keys } = req.body || {};
     let tokens = loadTokens();
-    const token = tokens.find(t => t.id === token_id);
-    if (!token) return res.status(404).json({ success: false, message: 'Không tìm thấy token' });
-
-    tokens = tokens.filter(t => t.id !== token_id);
-    saveTokens(tokens);
-
+    if (!tokens.find(t => t.id === token_id)) return res.status(404).json({ success: false, message: 'Không tìm thấy token' });
+    tokens = tokens.filter(t => t.id !== token_id); saveTokens(tokens);
     let deletedKeys = 0;
     if (delete_keys) {
-      let keys = loadKeys();
-      deletedKeys = keys.filter(k => k.token_id === token_id).length;
-      keys = keys.filter(k => k.token_id !== token_id);
-      saveKeys(keys);
-    } else {
-      // Detach keys from token
-      const keys = loadKeys();
-      keys.forEach(k => { if (k.token_id === token_id) { k.token_id = null; k.token_code = null; } });
-      saveKeys(keys);
+      let keys = loadKeys(); deletedKeys = keys.filter(k => k.token_id === token_id).length;
+      keys = keys.filter(k => k.token_id !== token_id); saveKeys(keys);
     }
-
-    logActivity('delete_token', 'admin', { tokenId: token_id, deletedKeys, ip: req.ip });
-    res.json({ success: true, message: `Đã xóa token${delete_keys ? ` và ${deletedKeys} key liên kết` : ''}` });
-  } catch (err) {
-    res.status(500).json({ success: false, message: 'Server error' });
-  }
+    logActivity('delete_token', 'admin', { token_id, deletedKeys, ip: req.ip });
+    res.json({ success: true, message: `Đã xóa token${delete_keys ? ` và ${deletedKeys} key` : ''}` });
+  } catch(e) { res.status(500).json({ success: false, message: 'Server error' }); }
 });
 
-/* GET KEYS UNDER A TOKEN */
-app.get('/api/token/keys', requireAdmin, (req, res) => {
-  try {
-    const token_id = req.query.token_id;
-    const keys = loadKeys();
-    const tokenKeys = keys.filter(k => k.token_id === token_id);
-    res.json({ success: true, keys: tokenKeys });
-  } catch (err) {
-    res.status(500).json({ success: false, message: 'Server error' });
-  }
-});
-
-/* CREATE KEY UNDER TOKEN */
+// Tạo key dưới token
 app.post('/api/token/create-key', requireAdmin, (req, res) => {
   try {
     const { token_id, days, devices, type, customKey, count } = req.body || {};
     if (!token_id) return res.status(400).json({ success: false, message: 'Thiếu token_id' });
-
     const tokens = loadTokens();
-    const token = tokens.find(t => t.id === token_id);
+    const token  = tokens.find(t => t.id === token_id);
     if (!token) return res.status(404).json({ success: false, message: 'Không tìm thấy token' });
     if (!days || !devices) return res.status(400).json({ success: false, message: 'Vui lòng nhập đầy đủ thông tin' });
-
     const keys = loadKeys();
-    const batchCount = Math.min(Math.max(Number(count) || 1, 1), 100);
-    const createdKeys = [];
-
-    for (let i = 0; i < batchCount; i++) {
-      let keyCode;
-      if (customKey && customKey.trim() && batchCount === 1) {
-        keyCode = customKey.trim();
-        if (keys.find(k => k.key_code === keyCode)) {
-          return res.status(400).json({ success: false, message: 'Key code đã tồn tại' });
-        }
-      } else {
-        keyCode = generateKey(type || 'KEY');
+    const n    = Math.min(Math.max(Number(count)||1, 1), 100);
+    const created = [];
+    for (let i = 0; i < n; i++) {
+      let keyCode = (customKey?.trim() && n === 1) ? customKey.trim() : generateKey(type||'KEY');
+      if (keys.find(k => k.key_code === keyCode)) {
+        if (n === 1) return res.status(400).json({ success: false, message: 'Key code đã tồn tại' });
+        keyCode = generateKey(type||'KEY');
       }
-
-      const record = {
-        id: uuidv4(),
-        key_code: keyCode,
-        type: type || 'KEY',
+      const rec = {
+        id: uuidv4(), key_code: keyCode, type: type||'KEY',
         signature: signValue(keyCode),
         created_at: new Date().toISOString(),
-        expires_at: new Date(Date.now() + Number(days) * 86400000).toISOString(),
-        allowed_devices: Number(devices),
-        devices: [],
-        owner: 'admin',
-        total_verifications: 0,
-        last_verified: null,
-        is_custom: !!(customKey && batchCount === 1),
-        token_id: token_id,
-        token_code: token.token_code,
-        token_name: token.name
+        expires_at: new Date(Date.now() + Number(days)*86400000).toISOString(),
+        allowed_devices: Number(devices), devices: [],
+        owner: 'admin', total_verifications: 0, last_verified: null,
+        is_custom: !!(customKey && n===1),
+        package_id:   token.package_id,
+        package_name: token.package_name,
+        token_id:     token_id,
+        token_code:   token.token_code,
+        token_name:   token.name
       };
-
-      keys.push(record);
-      createdKeys.push(record);
+      keys.push(rec); created.push(rec);
     }
-
     saveKeys(keys);
-
-    // Update key_count on token
-    token.key_count = keys.filter(k => k.token_id === token_id).length;
-    saveTokens(tokens);
-
-    logActivity('create_key_under_token', 'admin', { tokenId: token_id, count: batchCount, ip: req.ip });
-    res.json({ success: true, message: `Đã tạo ${batchCount} key dưới token`, keys: createdKeys });
-  } catch (err) {
-    console.error('Create key under token error:', err);
-    res.status(500).json({ success: false, message: 'Server error' });
-  }
+    logActivity('create_key_under_token', 'admin', { token_id, count: n, ip: req.ip });
+    res.json({ success: true, message: `Đã tạo ${n} key`, keys: created });
+  } catch(e) { console.error(e); res.status(500).json({ success: false, message: 'Server error' }); }
 });
 
-/* ================= END TOKEN SYSTEM ================= */
+// Lấy key theo token
+app.get('/api/token/keys', requireAdmin, (req, res) => {
+  try {
+    const { token_id } = req.query;
+    res.json({ success: true, keys: loadKeys().filter(k => k.token_id === token_id) });
+  } catch(e) { res.status(500).json({ success: false, message: 'Server error' }); }
+});
 
 /* ================= 404 HANDLER ================= */
 app.use((req, res) => {
@@ -948,5 +960,4 @@ const server = app.listen(PORT, () => {
 
 process.on('SIGTERM', () => { createBackup(); server.close(() => process.exit(0)); });
 process.on('SIGINT', () => { createBackup(); server.close(() => process.exit(0)); });
-
 
