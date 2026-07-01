@@ -112,6 +112,7 @@ function safeSaveJSON(file, data) {
     const tempFile = file + '.tmp';
     fs.writeFileSync(tempFile, JSON.stringify(data, null, 2), 'utf8');
     fs.renameSync(tempFile, file);
+    scheduleCloudSync();
     return true;
   } catch(err) {
     console.error(`❌ Error saving ${file}:`, err);
@@ -119,46 +120,142 @@ function safeSaveJSON(file, data) {
   }
 }
 
-/* ================= INIT FILES ================= */
-if (!fs.existsSync(DATA_FILE)) {
-  safeSaveJSON(DATA_FILE, []);
-  console.log('✅ Initialized keys.json');
-}
-if (!fs.existsSync(PACKAGES_FILE)) {
-  safeSaveJSON(PACKAGES_FILE, []);
-  console.log('✅ Initialized packages.json');
-}
-if (!fs.existsSync(TOKENS_FILE)) {
-  safeSaveJSON(TOKENS_FILE, []);
-  console.log('✅ Initialized tokens.json');
+/* ================= CLOUD BACKUP (GitHub Gist) =================
+   Render (và nhiều hosting free) dùng ổ đĩa tạm thời (ephemeral):
+   mỗi lần server ngủ/khởi động lại là dữ liệu local bị xóa sạch.
+   Đoạn dưới đây tự đẩy keys.json/tokens.json/... lên 1 Gist riêng
+   mỗi khi có thay đổi, và tự tải lại từ Gist mỗi khi server khởi động.
+
+   Thiết lập (làm 1 lần):
+   1) Tạo GitHub Personal Access Token, chỉ cần quyền "gist".
+      https://github.com/settings/tokens
+   2) Tạo 1 Gist mới (secret) bất kỳ, copy ID của nó
+      (chuỗi trong URL: gist.github.com/you/<GIST_ID>)
+   3) Trên Render -> Environment, thêm 2 biến:
+      GITHUB_TOKEN = <token của bạn>
+      GIST_ID      = <id gist ở bước 2>
+   4) Redeploy. Nếu thiếu 1 trong 2 biến, tính năng này tự tắt,
+      server vẫn chạy như cũ (chỉ là không có backup cloud).
+================================================================= */
+const https = require('https');
+const GITHUB_TOKEN = process.env.GITHUB_TOKEN || '';
+const GIST_ID       = process.env.GIST_ID || '';
+const CLOUD_SYNC    = !!(GITHUB_TOKEN && GIST_ID);
+
+const CLOUD_FILES = {
+  'keys.json': DATA_FILE,
+  'tokens.json': TOKENS_FILE,
+  'packages.json': PACKAGES_FILE,
+  'config.json': CONFIG_FILE,
+  'activity_logs.json': LOGS_FILE
+};
+
+function ghRequest(method, apiPath, body) {
+  return new Promise((resolve, reject) => {
+    const data = body ? JSON.stringify(body) : null;
+    const req = https.request({
+      hostname: 'api.github.com',
+      path: apiPath,
+      method,
+      headers: {
+        'User-Agent': 'authapi-cloud-sync',
+        'Authorization': `token ${GITHUB_TOKEN}`,
+        'Accept': 'application/vnd.github+json',
+        ...(data ? { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(data) } : {})
+      }
+    }, (res) => {
+      let chunks = '';
+      res.on('data', c => chunks += c);
+      res.on('end', () => {
+        try { resolve({ status: res.statusCode, body: JSON.parse(chunks || '{}') }); }
+        catch(e) { resolve({ status: res.statusCode, body: {} }); }
+      });
+    });
+    req.on('error', reject);
+    if (data) req.write(data);
+    req.end();
+  });
 }
 
-if (!fs.existsSync(LOGS_FILE)) {
-  safeSaveJSON(LOGS_FILE, []);
-  console.log('✅ Initialized activity_logs.json');
-}
-
-if (!fs.existsSync(CONFIG_FILE)) {
-  const adminPassword = process.env.ADMIN_PASSWORD || '1';
-  const hash = bcrypt.hashSync(adminPassword, 10);
-  const cfg = {
-    admin: {
-      username: 'admin',
-      passwordHash: hash,
-      plainPassword: adminPassword
-    },
-    contact: {
-      admin_profile: 'https://www.facebook.com/duc.pham.396384',
-      telegram: '@phamcduc0',
-      email: 'monhpham15@gmail.com'
-    },
-    settings: {
-      maintenance_mode: false,
-      max_key_days: 365
+async function pullFromGist() {
+  if (!CLOUD_SYNC) { console.log('ℹ️ Cloud sync tắt (thiếu GITHUB_TOKEN/GIST_ID)'); return; }
+  try {
+    const { status, body } = await ghRequest('GET', `/gists/${GIST_ID}`);
+    if (status !== 200 || !body.files) { console.error('❌ Không đọc được Gist backup, status:', status); return; }
+    for (const [name, filePath] of Object.entries(CLOUD_FILES)) {
+      const f = body.files[name];
+      if (f && f.content) {
+        fs.writeFileSync(filePath, f.content, 'utf8');
+        console.log(`☁️ Đã khôi phục ${name} từ Gist`);
+      }
     }
-  };
-  safeSaveJSON(CONFIG_FILE, cfg);
-  console.log('✅ Initialized config.json');
+  } catch(err) { console.error('❌ Lỗi khôi phục từ Gist:', err.message); }
+}
+
+let syncTimer = null;
+function scheduleCloudSync() {
+  if (!CLOUD_SYNC) return;
+  clearTimeout(syncTimer);
+  syncTimer = setTimeout(pushToGist, 3000); // gộp nhiều lần lưu liên tiếp lại thành 1 lần đẩy
+}
+
+async function pushToGist() {
+  if (!CLOUD_SYNC) return;
+  try {
+    const files = {};
+    for (const [name, filePath] of Object.entries(CLOUD_FILES)) {
+      if (fs.existsSync(filePath)) {
+        files[name] = { content: fs.readFileSync(filePath, 'utf8') || '[]' };
+      }
+    }
+    const { status } = await ghRequest('PATCH', `/gists/${GIST_ID}`, { files });
+    if (status === 200) console.log('☁️ Đã đồng bộ dữ liệu lên Gist backup');
+    else console.error('❌ Đẩy backup lên Gist thất bại, status:', status);
+  } catch(err) { console.error('❌ Lỗi đẩy backup lên Gist:', err.message); }
+}
+
+/* ================= INIT FILES ================= */
+function initDataFiles() {
+  if (!fs.existsSync(DATA_FILE)) {
+    safeSaveJSON(DATA_FILE, []);
+    console.log('✅ Initialized keys.json');
+  }
+  if (!fs.existsSync(PACKAGES_FILE)) {
+    safeSaveJSON(PACKAGES_FILE, []);
+    console.log('✅ Initialized packages.json');
+  }
+  if (!fs.existsSync(TOKENS_FILE)) {
+    safeSaveJSON(TOKENS_FILE, []);
+    console.log('✅ Initialized tokens.json');
+  }
+
+  if (!fs.existsSync(LOGS_FILE)) {
+    safeSaveJSON(LOGS_FILE, []);
+    console.log('✅ Initialized activity_logs.json');
+  }
+
+  if (!fs.existsSync(CONFIG_FILE)) {
+    const adminPassword = process.env.ADMIN_PASSWORD || '1';
+    const hash = bcrypt.hashSync(adminPassword, 10);
+    const cfg = {
+      admin: {
+        username: 'admin',
+        passwordHash: hash,
+        plainPassword: adminPassword
+      },
+      contact: {
+        admin_profile: 'https://www.facebook.com/duc.pham.396384',
+        telegram: '@phamcduc0',
+        email: 'monhpham15@gmail.com'
+      },
+      settings: {
+        maintenance_mode: false,
+        max_key_days: 365
+      }
+    };
+    safeSaveJSON(CONFIG_FILE, cfg);
+    console.log('✅ Initialized config.json');
+  }
 }
 
 /* ================= HELPERS ================= */
@@ -201,6 +298,15 @@ function logActivity(action, actor, details = {}) {
 
 function signValue(val) {
   return crypto.createHmac('sha256', HMAC_SECRET).update(val).digest('hex');
+}
+
+function escapeHtml(text) {
+  return String(text)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
 }
 
 function randomChunk(len) {
@@ -938,26 +1044,118 @@ app.get('/api/token/keys', requireAdmin, (req, res) => {
   } catch(e) { res.status(500).json({ success: false, message: 'Server error' }); }
 });
 
+/* ================= KEY PUBLIC PAGE ================= */
+app.get('/key/:key', (req, res) => {
+  try {
+    const keyCode = req.params.key;
+    const found = loadKeys().find(k => k.key_code === keyCode);
+    if (!found) {
+      return res.status(404).send(`<html><head><title>Key không tồn tại</title></head><body style="font-family:Arial, sans-serif;padding:40px;"><h1>Key không tồn tại</h1><p>Key: ${escapeHtml(keyCode)}</p></body></html>`);
+    }
+
+    const now = new Date();
+    const expiresAt = new Date(found.expires_at);
+    const isExpired = expiresAt < now;
+    const daysRemaining = Math.max(0, Math.ceil((expiresAt - now) / 86400000));
+    const devicesUsed = found.devices.length;
+    const devicesAllowed = found.allowed_devices;
+    const statusText = isExpired ? 'Hết hạn' : 'Hoạt động';
+    const statusColor = isExpired ? '#ef4444' : '#22c55e';
+
+    return res.send(`<!DOCTYPE html>
+<html lang="vi">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Key ${escapeHtml(found.key_code)}</title>
+  <style>body{font-family:Inter,system-ui,Arial,sans-serif;background:#f5f7fb;color:#111;margin:0;padding:0}main{max-width:760px;margin:40px auto;padding:24px;background:#fff;border:1px solid #e5e7eb;border-radius:16px;box-shadow:0 20px 50px rgba(15,23,42,.08)}h1{margin:0 0 12px;font-size:24px}p{margin:8px 0;font-size:15px;line-height:1.6}code{display:inline-block;padding:8px 12px;background:#f3f4f6;border-radius:8px;font-family:monospace;color:#111}button,input{font:inherit}input{width:100%;padding:12px 14px;border:1px solid #d1d5db;border-radius:10px;margin-top:8px}button{display:inline-flex;align-items:center;justify-content:center;padding:12px 18px;border:none;border-radius:10px;background:#4f46e5;color:#fff;cursor:pointer;margin-top:12px}button:hover{background:#4338ca} .badge{display:inline-flex;align-items:center;padding:6px 10px;border-radius:999px;font-size:13px;font-weight:700;color:#fff}</style>
+</head>
+<body>
+  <main>
+    <h1>Key: ${escapeHtml(found.key_code)}</h1>
+    <p><span class="badge" style="background:${statusColor}">${statusText}</span></p>
+    <p><strong>Loại:</strong> ${escapeHtml(found.type || 'KEY')}</p>
+    <p><strong>Ngày tạo:</strong> ${escapeHtml(found.created_at)}</p>
+    <p><strong>Hết hạn:</strong> ${escapeHtml(found.expires_at)}</p>
+    <p><strong>Trạng thái:</strong> ${isExpired ? 'Đã hết hạn' : `${daysRemaining} ngày còn lại`}</p>
+    <p><strong>Thiết bị:</strong> ${devicesUsed}/${devicesAllowed}</p>
+    <section style="margin-top:24px">
+      <h2 style="font-size:18px;margin-bottom:12px">Xác thực key</h2>
+      <p>Nhập device_id để xác thực key qua API.</p>
+      <input type="text" id="device-id" placeholder="Nhập device_id" autocomplete="off" />
+      <button id="verify-btn">Xác thực</button>
+      <div id="verify-result" style="margin-top:16px;font-size:14px"></div>
+    </section>
+    <section style="margin-top:24px">
+      <p>API verify: <code>/api/verify-key</code></p>
+      <p>Cơ chế gọi: <code>{ key: '${escapeHtml(found.key_code)}', device_id: 'DEVICE_ID' }</code></p>
+    </section>
+  </main>
+  <script>
+    const btn = document.getElementById('verify-btn');
+    const result = document.getElementById('verify-result');
+    btn.addEventListener('click', async () => {
+      const deviceId = document.getElementById('device-id').value.trim();
+      if (!deviceId) {
+        result.innerHTML = '<span style="color:#b91c1c">Vui lòng nhập device_id</span>';
+        return;
+      }
+      result.innerHTML = 'Đang gửi yêu cầu...';
+      try {
+        const resp = await fetch('/api/verify-key', {
+          method:'POST',
+          headers:{'content-type':'application/json'},
+          body: JSON.stringify({ key: '${escapeHtml(found.key_code)}', device_id: deviceId })
+        });
+        const json = await resp.json();
+        if (json.success) {
+          result.innerHTML = '<span style="color:#166534">✅ ' + json.message + '</span>';
+        } else {
+          result.innerHTML = '<span style="color:#b91c1c">❌ ' + json.message + '</span>';
+        }
+      } catch(err) {
+        result.innerHTML = '<span style="color:#b91c1c">Lỗi kết nối đến API</span>';
+      }
+    });
+  </script>
+</body>
+</html>`);
+  } catch(err) {
+    console.error('Key public page error:', err);
+    res.status(500).send('<html><body><h1>Lỗi server</h1></body></html>');
+  }
+});
+
 /* ================= 404 HANDLER ================= */
 app.use((req, res) => {
   res.status(404).json({ success: false, message: 'Endpoint not found', error_code: 'NOT_FOUND' });
 });
 
 /* ================= SERVER START ================= */
-const server = app.listen(PORT, () => {
-  console.log('╔═══════════════════════════════════════════════════╗');
-  console.log('║        AuthAPI v4.0 - Open Key System             ║');
-  console.log('╚═══════════════════════════════════════════════════╝');
-  console.log(`✅ Server: http://localhost:${PORT}`);
-  console.log('🔑 Tạo key: Không cần đăng nhập');
-  console.log('♾️  Không giới hạn số lượng key');
-  console.log('📦 Bulk create: 1-100 keys');
-  console.log('💾 Auto backup: Mỗi 6 giờ');
-  console.log('📊 Activity logs: 1000 actions gần nhất');
-  console.log('═══════════════════════════════════════════════════');
-  createBackup();
-});
+async function startServer() {
+  // 1) Thử khôi phục dữ liệu từ Gist backup trước (nếu có cấu hình cloud sync)
+  await pullFromGist();
+  // 2) Chỉ tạo file mặc định cho những file vẫn chưa tồn tại sau khi khôi phục
+  initDataFiles();
 
-process.on('SIGTERM', () => { createBackup(); server.close(() => process.exit(0)); });
-process.on('SIGINT', () => { createBackup(); server.close(() => process.exit(0)); });
+  const server = app.listen(PORT, () => {
+    console.log('╔═══════════════════════════════════════════════════╗');
+    console.log('║        AuthAPI v4.0 - Open Key System             ║');
+    console.log('╚═══════════════════════════════════════════════════╝');
+    console.log(`✅ Server: http://localhost:${PORT}`);
+    console.log('🔑 Tạo key: Không cần đăng nhập');
+    console.log('♾️  Không giới hạn số lượng key');
+    console.log('📦 Bulk create: 1-100 keys');
+    console.log('💾 Auto backup: Mỗi 6 giờ');
+    console.log(`☁️  Cloud sync (Gist): ${CLOUD_SYNC ? 'BẬT' : 'TẮT'}`);
+    console.log('📊 Activity logs: 1000 actions gần nhất');
+    console.log('═══════════════════════════════════════════════════');
+    createBackup();
+  });
+
+  process.on('SIGTERM', () => { pushToGist(); createBackup(); server.close(() => process.exit(0)); });
+  process.on('SIGINT', () => { pushToGist(); createBackup(); server.close(() => process.exit(0)); });
+}
+
+startServer();
 
